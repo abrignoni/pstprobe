@@ -142,12 +142,49 @@ def item_detail(message):
             attachments.append(['0x%x' % a.nid, name, kind, _text(a.method), _text(a.size), _text(size)])
     except pstprobe.DAMAGE_ERRORS as error:
         attachments.append(['', 'error: %s' % error, '', '', '', ''])
-    try:
-        body = message.get(0x1000)
-    except pstprobe.DAMAGE_ERRORS as error:
-        body = 'error: %s' % error
     return {'props': props, 'recipients': recipients, 'attachments': attachments,
-            'body': body if isinstance(body, str) else ''}
+            'bodies': item_bodies(message)}
+
+
+def _decode_html(data):
+    if isinstance(data, str):
+        return data
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError:
+        return data.decode('cp1252', errors='replace')
+
+
+def _shown(text):
+    # Tk's Text widget drops NUL characters (an RTF body can end with one, counted in its
+    # RAWSIZE), so they are left out on purpose here; Save Body writes the stored bytes.
+    return text.replace('\0', '')
+
+
+# kind -> (button label, how to read it, how to show it, file extension)
+_BODY_KINDS = (
+    ('text', 'Plain text (0x1000)', lambda m: m.body(), _shown, '.txt'),
+    ('html', 'HTML source (0x1013)', lambda m: m.html_body(), lambda v: _shown(_decode_html(v)), '.html'),
+    ('rtf', 'RTF source (0x1009, decompressed)', lambda m: m.rtf_body(),
+     lambda v: _shown(v.decode('latin-1')), '.rtf'),
+)
+
+
+def item_bodies(message):
+    """kind -> (text to show, bytes to save) for each body the item stores; a damaged one
+    shows its error and saves nothing."""
+    out = {}
+    for kind, _label, read, show, _ext in _BODY_KINDS:
+        try:
+            value = read(message)
+        except pstprobe.DAMAGE_ERRORS as error:
+            out[kind] = ('error: %s' % error, None)
+            continue
+        if value is None:
+            continue
+        raw = value.encode('utf-8') if isinstance(value, str) else bytes(value)
+        out[kind] = (show(value), raw)
+    return out
 
 
 class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-methods
@@ -250,9 +287,9 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         self.page_label.pack(side='left', padx=4)
         ttk.Button(pager, text='Next', command=lambda: self.show_page(self.page + 1)).pack(side='right')
         ttk.Button(pager, text='Previous', command=lambda: self.show_page(self.page - 1)).pack(side='right')
-        columns = [('t%d' % i, label, 150) for i, (_pid, label) in enumerate(_TIME_TAGS)]
-        columns += [('class', 'Class', 150), ('subject', 'Subject', 300), ('recipients', 'Recipients', 80),
-                    ('attachments', 'Attachments', 90), ('nid', 'NID', 90)]
+        columns = [('t%d' % i, label, 140) for i, (_pid, label) in enumerate(_TIME_TAGS)]
+        columns += [('class', 'Class', 120), ('subject', 'Subject', 220), ('recipients', 'Recipients', 75),
+                    ('attachments', 'Attachments', 85), ('nid', 'NID', 80)]
         frame, self.items = self._table(top, columns)
         frame.pack(fill='both', expand=True)
         self.items.bind('<<TreeviewSelect>>', self._on_item)
@@ -277,8 +314,21 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                                              ('data', 'Data bytes', 110)])
         frame.pack(fill='both', expand=True)
         self.tabs.add(att, text='Attachments')
-        self.body = tk.Text(self.tabs, wrap='word', state='disabled', borderwidth=0, highlightthickness=0)
-        self.tabs.add(self.body, text='Body')
+        body = ttk.Frame(self.tabs)
+        bar = ttk.Frame(body)
+        bar.pack(side='top', fill='x', pady=2)
+        self.body_kind = tk.StringVar(value='text')
+        self.body_buttons = {}
+        for kind, label, _read, _show, _ext in _BODY_KINDS:
+            button = ttk.Radiobutton(bar, text=label, value=kind, variable=self.body_kind,
+                                     command=self._show_body, state='disabled')
+            button.pack(side='left', padx=(0, 10))
+            self.body_buttons[kind] = button
+        ttk.Button(bar, text='Save Body...', command=self.save_body).pack(side='right')
+        self.body = tk.Text(body, wrap='word', state='disabled', borderwidth=0, highlightthickness=0)
+        self.body.pack(fill='both', expand=True)
+        self.bodies = {}
+        self.tabs.add(body, text='Body')
 
     def _menus(self):
         menubar = tk.Menu(self.root, tearoff=False)
@@ -291,6 +341,7 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         files.add_separator()
         files.add_command(label='Save Attachments of Selected Item...', accelerator=f'{_MOD_LABEL}+E',
                           command=self.save_item_attachments)
+        files.add_command(label='Save Shown Body of Selected Item...', command=self.save_body)
         files.add_command(label='Export Selected Folder...', command=lambda: self.export_dialog(False))
         files.add_command(label='Export Selected Folder and Subfolders...', command=lambda: self.export_dialog(True))
         if not _MAC:
@@ -384,9 +435,13 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
     def _finish(self, done, result):
         if isinstance(result, Exception):
             cancelled = str(result) == 'cancelled'
-            self._stop_busy('Cancelled.' if cancelled else f'Error: {result}')
+            if isinstance(result, FileExistsError):
+                text = f'Will not replace a file that already exists: {result.filename}'
+            else:
+                text = str(result)
+            self._stop_busy('Cancelled.' if cancelled else f'Error: {text}')
             if not cancelled:
-                messagebox.showerror('pstprobe', str(result), parent=self.root)
+                messagebox.showerror('pstprobe', text, parent=self.root)
         else:
             self._stop_busy('Ready')
             done(result)
@@ -522,8 +577,45 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
     def _clear_detail(self):
         for view in (self.props, self.recips, self.atts):
             view.delete(*view.get_children(''))
-        self._set_body('')
+        self._set_bodies({})
         self.message = None
+
+    def _set_bodies(self, bodies):
+        """Enable a button per stored body and show the first of plain text, HTML, RTF."""
+        self.bodies = bodies
+        for kind, button in self.body_buttons.items():
+            button.configure(state='normal' if kind in bodies else 'disabled')
+        first = next((kind for kind, *_rest in _BODY_KINDS if kind in bodies), None)
+        if first is not None:
+            self.body_kind.set(first)
+        self._show_body()
+
+    def _show_body(self):
+        if not self.bodies:
+            self._set_body('' if self.message is None else 'This item stores no body.')
+            return
+        shown = self.bodies.get(self.body_kind.get())
+        self._set_body(shown[0] if shown else '')
+
+    def save_body(self, target=None):
+        shown = self.bodies.get(self.body_kind.get())
+        if self.message is None or not shown or shown[1] is None:
+            self.set_status('Select an item with a body first.')
+            return None
+        ext = next(e for kind, _l, _r, _s, e in _BODY_KINDS if kind == self.body_kind.get())
+        target = target or filedialog.asksaveasfilename(
+            title='Save body', parent=self.root, defaultextension=ext,
+            initialfile='%06x_body%s' % (self.message.nid, ext))
+        if not target:
+            return None
+        data = shown[1]
+
+        def work():
+            with open(target, 'xb') as out:
+                out.write(data)
+            return len(data)
+        self._run('Saving...', work, lambda n: self.set_status(f'Saved {n:,} bytes to {target}'))
+        return target
 
     def _set_body(self, text):
         self.body.configure(state='normal')
@@ -554,7 +646,7 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 self.recips.insert('', 'end', values=row)
             for row in detail['attachments']:
                 self.atts.insert('', 'end', values=row)
-            self._set_body(detail['body'])
+            self._set_bodies(detail['bodies'])
         self._run('Reading the item...', work, done)
 
     # -- export -----------------------------------------------------------------------------
@@ -607,7 +699,7 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         self._run('Exporting...', lambda: pstprobe.export_folder(pst, folder, out, recursive,
                                                                   cancel=self.cancel_flag.is_set),
                   lambda c: self.set_status(f'Exported {c["folders"]} folder(s), {c["items"]} items, '
-                                            f'{c["attachments"]} attachment files to {out}'))
+                                            f'{c["attachments"]} attachment files, {c["rtf_bodies"]} RTF bodies to {out}'))
         return out
 
     # -- copy and sort ----------------------------------------------------------------------
@@ -716,7 +808,14 @@ def selfcheck(path):
             report['properties_shown'] = len(window.props.get_children(''))
             report['recipients_shown'] = len(window.recips.get_children(''))
             report['attachments_shown'] = len(window.atts.get_children(''))
+            report['bodies_shown'] = sorted(window.bodies)
+            report['body_chars_shown'] = len(window.body.get('1.0', 'end-1c'))
             with tempfile.TemporaryDirectory() as folder:
+                saved = window.save_body(os.path.join(folder, 'body.out'))
+                if saved:
+                    window._wait()  # pylint: disable=protected-access
+                    report['body_bytes_saved'] = os.path.getsize(saved)
+                    os.remove(saved)
                 window.save_item_attachments(folder)
                 window._wait()  # pylint: disable=protected-access
                 report['attachment_files_saved'] = len(os.listdir(folder))

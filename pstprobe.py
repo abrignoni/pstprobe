@@ -241,6 +241,9 @@ PS_PUBLIC_STRINGS = uuid.UUID("00020329-0000-0000-c000-000000000046")
 # Property identifiers used by the messaging helpers ([MS-OXPROPS]).
 PID_TAG_DISPLAY_NAME = 0x3001
 PID_TAG_PST_PASSWORD = 0x67FF
+PID_TAG_BODY = 0x1000
+PID_TAG_RTF_COMPRESSED = 0x1009
+PID_TAG_BODY_HTML = 0x1013
 PID_TAG_CONTENT_COUNT = 0x3602
 PID_TAG_CONTENT_UNREAD_COUNT = 0x3603
 PID_TAG_SUBFOLDERS = 0x360A
@@ -1274,6 +1277,92 @@ class Folder:
                 yield m
 
 
+# ---------------------------------------------------------------------------
+# Compressed RTF, [MS-OXRTFCP] v20250520
+
+_RTF_COMPRESSED = 0x75465A4C    # "LZFu"
+_RTF_UNCOMPRESSED = 0x414C454D  # "MELA"
+# 2.1.2.1: the dictionary's first 207 bytes.
+_RTF_PRELOAD = (b"{\\rtf1\\ansi\\mac\\deff0\\deftab720{\\fonttbl;}{\\f0\\fnil \\froman \\fswiss "
+                b"\\fmodern \\fscript \\fdecor MS Sans SerifSymbolArialTimes New RomanCourier"
+                b"{\\colortbl\\red0\\green0\\blue0\r\n\\par \\pard\\plain\\f0\\fs20\\b\\i\\u\\tab\\tx")
+assert len(_RTF_PRELOAD) == 207
+
+
+def rtf_crc(data, value=0):
+    """The CRC of [MS-OXRTFCP] 2.1.3.2. Its table (2.1.2.2.1) is the common reflected CRC-32
+    table, but it starts from the given value with no final inversion, so it is zlib's CRC-32
+    with the inversions undone."""
+    return (~zlib.crc32(data, ~value & 0xFFFFFFFF)) & 0xFFFFFFFF
+
+
+def decompress_rtf(data):
+    """Decompress a PidTagRtfCompressed value, [MS-OXRTFCP] 2.2. Returns the RTF as bytes.
+
+    Raises CorruptError where the specification says the reader MUST treat the input as
+    corrupt: an unknown COMPTYPE, input that ends before the end marker, or a CRC that does
+    not match. The output is not cut to RAWSIZE; `rtf_header()` gives it for comparison.
+    """
+    if len(data) < 16:
+        raise CorruptError("compressed RTF is %d bytes, shorter than its 16-byte header" % len(data))
+    compsize, rawsize, comptype, crc = struct.unpack_from("<IIII", data, 0)
+    if comptype == _RTF_UNCOMPRESSED:
+        # 2.2.3.1: read to the end of the stream whatever RAWSIZE says; no CRC check.
+        return bytes(data[16:])
+    if comptype != _RTF_COMPRESSED:
+        raise CorruptError("compressed RTF has COMPTYPE 0x%08x, neither LZFu nor MELA" % comptype)
+    contents = memoryview(data)[16:]
+    n = len(contents)
+    dictionary = bytearray(4096)
+    dictionary[:207] = _RTF_PRELOAD
+    write = 207
+    out = bytearray()
+    i = 0
+    while True:
+        if i >= n:
+            raise CorruptError("compressed RTF ends before its end marker")
+        control = contents[i]
+        i += 1
+        for bit in range(8):
+            if control & (1 << bit):
+                if i + 2 > n:
+                    raise CorruptError("compressed RTF ends inside a dictionary reference")
+                ref = (contents[i] << 8) | contents[i + 1]  # big-endian, 2.1.3.1.5
+                i += 2
+                offset = ref >> 4
+                if offset == write:
+                    # 2.2.3: the CRC covers every byte of CONTENTS, padding included.
+                    if rtf_crc(contents) != crc:
+                        raise CorruptError("compressed RTF CRC is 0x%08x, the header records 0x%08x"
+                                           % (rtf_crc(contents), crc))
+                    return bytes(out)
+                for _ in range((ref & 0xF) + 2):
+                    c = dictionary[offset]
+                    out.append(c)
+                    dictionary[write] = c
+                    offset = (offset + 1) & 0xFFF
+                    write = (write + 1) & 0xFFF
+            else:
+                if i >= n:
+                    raise CorruptError("compressed RTF ends inside a literal")
+                c = contents[i]
+                i += 1
+                out.append(c)
+                dictionary[write] = c
+                write = (write + 1) & 0xFFF
+
+
+def rtf_header(data):
+    """The four header fields of a PidTagRtfCompressed value as a dict, or None if short."""
+    if data is None or len(data) < 16:
+        return None
+    compsize, rawsize, comptype, crc = struct.unpack_from("<IIII", data, 0)
+    return {"compsize": compsize, "rawsize": rawsize,
+            "comptype": {_RTF_COMPRESSED: "LZFu", _RTF_UNCOMPRESSED: "MELA"}.get(comptype,
+                                                                               "0x%08x" % comptype),
+            "crc": crc}
+
+
 class Message:
     def __init__(self, pst, node):
         self.pst = pst
@@ -1300,6 +1389,24 @@ class Message:
     @property
     def subject(self):
         return _clean_subject(self.pc.get(PID_TAG_SUBJECT))
+
+    def body(self):
+        """PidTagBody, the plain-text body, as stored (str), or None."""
+        return self.pc.get(PID_TAG_BODY)
+
+    def html_body(self):
+        """PidTagBodyHtml as stored: bytes when stored as PtypBinary, str as PtypString."""
+        return self.pc.get(PID_TAG_BODY_HTML)
+
+    def rtf_body(self):
+        """PidTagRtfCompressed decompressed ([MS-OXRTFCP]) to RTF bytes, or None if absent.
+        Raises CorruptError if the stored value is damaged."""
+        value = self.pc.get(PID_TAG_RTF_COMPRESSED)
+        if value is None:
+            return None
+        if not isinstance(value, (bytes, bytearray)):
+            raise CorruptError("PidTagRtfCompressed of message 0x%x is not binary" % self.nid)
+        return decompress_rtf(value)
 
     def recipient_table(self):
         sub = self.node.subnode(NID_RECIPIENT_TABLE)
@@ -1512,9 +1619,12 @@ def write_attachment(attachment, path):
     return written
 
 
-def item_record(message, attachments_dir=None, rel_dir="attachments", depth=0, chain=None):
+def item_record(message, attachments_dir=None, rel_dir="attachments", depth=0, chain=None,
+                bodies_dir=None, bodies_rel="bodies"):
     """One item as a dict: its properties, recipients and attachments. With attachments_dir,
-    each file attachment is written there and its record names the file."""
+    each file attachment is written there and its record names the file. With bodies_dir, a
+    compressed RTF body is decompressed and written there as <chain>.rtf, named in the
+    record as rtf_file."""
     pst = message.pst
     chain = chain if chain is not None else "%06x" % message.nid
     rec = OrderedDict()
@@ -1522,6 +1632,17 @@ def item_record(message, attachments_dir=None, rel_dir="attachments", depth=0, c
     rec["message_class"] = message.message_class
     rec["subject"] = message.subject
     rec["properties"] = properties_record(message.pc, pst)
+    if bodies_dir is not None:
+        try:
+            rtf = message.rtf_body()
+            if rtf is not None:
+                os.makedirs(bodies_dir, exist_ok=True)
+                name = chain + ".rtf"
+                with open(os.path.join(bodies_dir, name), "xb") as out:
+                    out.write(rtf)
+                rec["rtf_file"] = bodies_rel + "/" + name
+        except DAMAGE_ERRORS as exc:
+            rec["rtf_error"] = str(exc)
     try:
         rec["recipients"] = [OrderedDict(("0x%04x" % k if isinstance(k, int) else k, jsonable(v))
                                          for k, v in r.items()) for r in message.recipients()]
@@ -1540,7 +1661,8 @@ def item_record(message, attachments_dir=None, rel_dir="attachments", depth=0, c
                 if a.is_embedded_message:
                     em = a.embedded_message()
                     ad["embedded_item"] = item_record(em, attachments_dir, rel_dir, depth + 1,
-                                                      "%s_%06x" % (chain, a.nid)) \
+                                                      "%s_%06x" % (chain, a.nid),
+                                                      bodies_dir, bodies_rel) \
                         if em is not None and depth < 8 else None
                 else:
                     ad["data_size"] = a.data_size()
@@ -1561,11 +1683,12 @@ def export_folder(pst, folder, outdir, recursive=False, cancel=None, progress=No
     """Write a folder's items to outdir/items.jsonl (one item_record per line) and their file
     attachments to outdir/attachments/. With recursive, each subfolder goes to a folder of its
     own below, named from its display name and NID. Returns counts."""
-    counts = {"folders": 0, "items": 0, "attachments": 0, "errors": 0}
+    counts = {"folders": 0, "items": 0, "attachments": 0, "rtf_bodies": 0, "errors": 0}
 
     def one(f, target):
         os.makedirs(target, exist_ok=True)
         att_dir = os.path.join(target, "attachments")
+        body_dir = os.path.join(target, "bodies")
         counts["folders"] += 1
         with open(os.path.join(target, "items.jsonl"), "w", encoding="utf-8", newline="\n") as out:
             for nid in f.message_nids():
@@ -1578,8 +1701,9 @@ def export_folder(pst, folder, outdir, recursive=False, cancel=None, progress=No
                         counts["errors"] += 1
                     else:
                         os.makedirs(att_dir, exist_ok=True)
-                        rec = item_record(m, att_dir)
+                        rec = item_record(m, att_dir, bodies_dir=body_dir)
                         counts["attachments"] += _count_files(rec)
+                        counts["rtf_bodies"] += _count_files(rec, "rtf_file")
                 except PSTError as exc:
                     if str(exc) == "cancelled":
                         raise
@@ -1605,14 +1729,16 @@ def export_folder(pst, folder, outdir, recursive=False, cancel=None, progress=No
     return counts
 
 
-def _count_files(rec):
-    n = 0
+def _count_files(rec, key=None):
+    """Files a record names: attachment files, or with key="rtf_file" RTF bodies, attached
+    items included."""
+    n = 1 if key is not None and key in rec else 0
     for a in rec.get("attachments") or []:
         if isinstance(a, dict):
-            if "file" in a:
+            if key is None and "file" in a:
                 n += 1
             if a.get("embedded_item"):
-                n += _count_files(a["embedded_item"])
+                n += _count_files(a["embedded_item"], key)
     return n
 
 
@@ -1722,6 +1848,31 @@ def _cmd_props(pst, args):
         print("0x%04x 0x%04x%s\t%s" % (pid, ptype, label, _json_default(val) if not isinstance(val, (int, float, str, bool, type(None))) else val))
 
 
+def _cmd_body(pst, args):
+    nid = int(args.nid, 0)
+    m = pst.message(nid)
+    if m is None:
+        raise PSTError("no node 0x%x" % nid)
+    if args.format == "rtf":
+        data = m.rtf_body()
+    elif args.format == "html":
+        data = m.html_body()
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+    else:
+        data = m.body()
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+    if data is None:
+        raise PSTError("message 0x%x has no %s body" % (nid, args.format))
+    if args.output:
+        with open(args.output, "xb") as out:
+            out.write(data)
+    else:
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+
+
 def _cmd_extract(pst, args):
     os.makedirs(args.output, exist_ok=True)
     count = 0
@@ -1750,6 +1901,7 @@ def main(argv=None):
                            ("folders", "folder tree with item counts"),
                            ("items", "one JSON line per item: class, recipients, attachments"),
                            ("props", "every property of one node"),
+                           ("body", "one item's body: plain text, HTML, or RTF decompressed"),
                            ("extract", "write every file attachment to a folder"),
                            ("export", "write a folder's items (JSON lines) and attachments")):
         s = sub.add_parser(name, help=helptext)
@@ -1758,6 +1910,12 @@ def main(argv=None):
             s.add_argument("--subjects", action="store_true", help="include subjects")
         if name == "props":
             s.add_argument("nid", help="node ID, e.g. 0x21 or 2097188")
+        if name == "body":
+            s.add_argument("nid", help="the item's node ID")
+            s.add_argument("--format", choices=("text", "html", "rtf"), default="text",
+                           help="text is PidTagBody (UTF-8 out), html PidTagBodyHtml, rtf "
+                                "PidTagRtfCompressed decompressed (default: text)")
+            s.add_argument("-o", "--output", help="write to this file (refuses to replace one)")
         if name in ("extract", "export"):
             s.add_argument("-o", "--output", required=True)
         if name == "export":
@@ -1767,7 +1925,7 @@ def main(argv=None):
     try:
         with open_pst(args.file) as pst:
             {"info": _cmd_info, "folders": _cmd_folders, "items": _cmd_items,
-             "props": _cmd_props, "extract": _cmd_extract, "export": _cmd_export}[args.cmd](pst, args)
+             "props": _cmd_props, "body": _cmd_body, "extract": _cmd_extract, "export": _cmd_export}[args.cmd](pst, args)
     except PSTError as exc:
         print("pstprobe: %s" % exc, file=sys.stderr)
         return 1

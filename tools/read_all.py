@@ -11,6 +11,8 @@ in the file itself:
 - the bytes read from each attached file against its data size;
 - an attached file's data size against its PidTagAttachSize (data plus overhead, so it
   must not be smaller);
+- each compressed RTF body (PidTagRtfCompressed) against its own CRC, which
+  `decompress_rtf` checks, and its decompressed length against the header's RAWSIZE;
 - each item's recipient count against the names in its PidTagDisplayTo, Cc and Bcc. A
   display name holding ";" miscounts, so these are tallied, not counted as failures.
 
@@ -30,6 +32,13 @@ DISPLAY_TAGS = (0x0E04, 0x0E03, 0x0E02)  # PidTagDisplayTo, PidTagDisplayCc, Pid
 
 
 def check_message(m, r, depth):
+    rtf_value = m.pc.get(0x1009)  # PidTagRtfCompressed
+    if rtf_value is not None:
+        r["rtf_bodies"] += 1
+        rtf = m.rtf_body()  # raises CorruptError on a bad CRC
+        header = pstprobe.rtf_header(rtf_value)
+        if header["comptype"] == "LZFu" and header["rawsize"] != len(rtf):
+            r["failures"]["RTF length differs from RAWSIZE"] += 1
     recips = m.recipients()
     r["recipients"] += len(recips)
     if depth == 0:
@@ -65,9 +74,10 @@ def check_message(m, r, depth):
             r["failures"]["attachment data larger than PidTagAttachSize"] += 1
 
 
-def check_file(path):
-    r = {"file": os.path.basename(path), "folders": 0, "items": 0, "recipients": 0,
-         "attachments": 0, "attached_items": 0, "attachments_without_data": 0,
+def check_file(path, name=None):
+    """path may be a binary file object, with name for the report."""
+    r = {"file": name or os.path.basename(path), "folders": 0, "items": 0, "recipients": 0,
+         "attachments": 0, "attached_items": 0, "rtf_bodies": 0, "attachments_without_data": 0,
          "attachment_bytes": 0, "display_list": Counter(), "failures": Counter(),
          "failure_examples": []}
     start = time.monotonic()

@@ -1,6 +1,7 @@
 import contextlib
 import datetime
 import io
+import struct
 import os
 import sys
 import unittest
@@ -188,6 +189,71 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(f.read(), facts["att_payload"])
 
 
+# [MS-OXRTFCP] v20250520 3.1.1 and 3.1.2: the two worked examples.
+RTF_EXAMPLE_1 = bytes.fromhex("2d0000002b0000004c5a4675f1c5c7a703000a007263706731323542320af320"
+                              "68656c090020627705b06c647d0a800fa0")
+RTF_EXAMPLE_2 = bytes.fromhex("1a0000001c0000004c5a4675e2d44b51410004205758595a0d6e7d010eb0")
+
+
+class RtfTests(unittest.TestCase):
+    def test_spec_examples(self):
+        self.assertEqual(P.decompress_rtf(RTF_EXAMPLE_1),
+                         b"{\\rtf1\\ansi\\ansicpg1252\\pard hello world}\r\n")
+        # The specification's text prints "{\\ref1" here. The first token is a reference to
+        # dictionary offset 0 for 6 bytes, which holds "{\\rtf1", and the CRC matches.
+        self.assertEqual(P.decompress_rtf(RTF_EXAMPLE_2), b"{\\rtf1 WXYZWXYZWXYZWXYZWXYZ}")
+        self.assertEqual(P.rtf_header(RTF_EXAMPLE_1),
+                         {"compsize": 0x2d, "rawsize": 0x2b, "comptype": "LZFu", "crc": 0xa7c7c5f1})
+
+    def test_crc_matches_spec_table(self):
+        # 2.1.2.2.1 lists the table; rebuild it from the reflected polynomial and run 2.1.3.2.
+        table = []
+        for n in range(256):
+            c = n
+            for _ in range(8):
+                c = (c >> 1) ^ 0xEDB88320 if c & 1 else c >> 1
+            table.append(c)
+        self.assertEqual(table[1], 0x77073096)
+        crc = 0
+        for byte in RTF_EXAMPLE_1[16:]:
+            crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+        self.assertEqual(crc, 0xa7c7c5f1)
+        self.assertEqual(P.rtf_crc(RTF_EXAMPLE_1[16:]), crc)
+
+    def test_uncompressed_is_copied_to_the_end(self):
+        raw = struct.pack("<IIII", 12 + 5, 3, 0x414C454D, 0) + b"{\\rtf}"
+        self.assertEqual(P.decompress_rtf(raw), b"{\\rtf}")
+
+    def test_corrupt_inputs(self):
+        bad_crc = bytearray(RTF_EXAMPLE_1)
+        bad_crc[12] ^= 1
+        bad_type = bytearray(RTF_EXAMPLE_1)
+        bad_type[8:12] = b"ABCD"
+        padded = bytearray(RTF_EXAMPLE_1) + b"\0"  # padding counts in the CRC, 2.2.3
+        for raw in (bytes(bad_crc), bytes(bad_type), RTF_EXAMPLE_1[:-3], RTF_EXAMPLE_1[:10],
+                    bytes(padded)):
+            with self.assertRaises(P.CorruptError):
+                P.decompress_rtf(raw)
+
+    def test_message_rtf_body_and_export(self):
+        import json
+        import tempfile
+        raw, facts = pstbuilder.build_sample("unicode", P.CRYPT_PERMUTE, rtf=RTF_EXAMPLE_1)
+        with tempfile.TemporaryDirectory() as d:
+            with P.open_pst(io.BytesIO(raw)) as pst:
+                m = pst.message(facts["msg"])
+                self.assertEqual(m.rtf_body(), P.decompress_rtf(RTF_EXAMPLE_1))
+                self.assertIsNone(m.body())
+                counts = P.export_folder(pst, pst.root_folder(), d, recursive=True)
+            self.assertEqual(counts["rtf_bodies"], 1)
+            inbox = os.path.join(d, "Inbox_%06x" % facts["inbox"])
+            with open(os.path.join(inbox, "items.jsonl"), encoding="utf-8") as f:
+                rec = json.loads(f.readline())
+            self.assertEqual(rec["rtf_file"], "bodies/%06x.rtf" % facts["msg"])
+            with open(os.path.join(inbox, rec["rtf_file"]), "rb") as f:
+                self.assertEqual(f.read(), P.decompress_rtf(RTF_EXAMPLE_1))
+
+
 class ExportTests(unittest.TestCase):
     def test_export_folder_writes_items_and_attachments(self):
         import json
@@ -196,7 +262,8 @@ class ExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             with P.open_pst(io.BytesIO(raw)) as pst:
                 counts = P.export_folder(pst, pst.root_folder(), d, recursive=True)
-            self.assertEqual(counts, {"folders": 2, "items": 1, "attachments": 1, "errors": 0})
+            self.assertEqual(counts, {"folders": 2, "items": 1, "attachments": 1, "rtf_bodies": 0,
+                                      "errors": 0})
             inbox = os.path.join(d, "Inbox_%06x" % facts["inbox"])
             with open(os.path.join(inbox, "items.jsonl"), encoding="utf-8") as f:
                 rec = json.loads(f.readline())
@@ -270,7 +337,7 @@ class WindowTest(unittest.TestCase):
         if sys.platform == "darwin" and tkinter.TkVersion >= 9 and not os.environ.get("PSTPROBE_REQUIRE_GUI"):
             # Tk 9.0.3 (python.org 3.14) aborts on macOS and pops a crash dialog on the desktop
             self.skipTest("Tk 9 on macOS; run this test with a Python that ships Tk 8.6")
-        raw, _ = pstbuilder.build_sample("unicode", P.CRYPT_PERMUTE)
+        raw, _ = pstbuilder.build_sample("unicode", P.CRYPT_PERMUTE, rtf=RTF_EXAMPLE_1)
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "s.pst")
             with open(path, "wb") as f:
@@ -285,7 +352,8 @@ class WindowTest(unittest.TestCase):
             self.fail("window self-check failed (%d): %s" % (done.returncode, done.stderr[-500:]))
         self.assertEqual(json.loads(done.stdout), {
             "window": "built", "menus": 4 + (sys.platform == "darwin"), "folders_shown": 2,
-            "items_shown": 1, "properties_shown": 3, "recipients_shown": 2, "attachments_shown": 1,
+            "items_shown": 1, "properties_shown": 4, "recipients_shown": 2, "attachments_shown": 1,
+            "bodies_shown": ["rtf"], "body_chars_shown": 43, "body_bytes_saved": 43,
             "attachment_files_saved": 1, "exported_items": 1})
 
 

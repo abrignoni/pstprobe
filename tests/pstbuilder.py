@@ -275,7 +275,7 @@ def i32(v):
     return struct.pack("<i", v)
 
 
-def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False, password=None):
+def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False, password=None, rtf=None):
     """A store with a root folder, one child folder 'Inbox' holding one message that has
     two recipients, one file attachment of 20,000 bytes (a data tree) and one named
     property. Returns (bytes, facts)."""
@@ -331,9 +331,12 @@ def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False, password
         (att_nid, b.data(att_pc), att_sub),
     ])
     when = struct.pack("<Q", WHEN_FILETIME)
-    b.node(msg, b.pc([(P.PID_TAG_MESSAGE_CLASS, P.PT_UNICODE, u16("IPM.Appointment")),
-                      (P.PID_TAG_SUBJECT, P.PT_UNICODE, u16("\x01\x04RE: kd subject")),
-                      (0x8000, P.PT_SYSTIME, when)]), sub=sub, parent=inbox)
+    props = [(P.PID_TAG_MESSAGE_CLASS, P.PT_UNICODE, u16("IPM.Appointment")),
+             (P.PID_TAG_SUBJECT, P.PT_UNICODE, u16("\x01\x04RE: kd subject")),
+             (0x8000, P.PT_SYSTIME, when)]
+    if rtf is not None:
+        props.append((P.PID_TAG_RTF_COMPRESSED, P.PT_BINARY, rtf))
+    b.node(msg, b.pc(props), sub=sub, parent=inbox)
     if compress:
         b.inflate.update(bid for bid in b.blocks if not bid & 2)
     facts = {"inbox": inbox, "msg": msg, "att_payload": att_payload, "guid_appt": guid_appt}
