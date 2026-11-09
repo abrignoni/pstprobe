@@ -146,9 +146,23 @@ def item_detail(message):
             'bodies': item_bodies(message)}
 
 
-def _decode_html(data):
+# Windows code page numbers that Python does not know as "cp<number>".
+_CODEPAGES = {20127: 'ascii', 28591: 'latin-1', 28592: 'iso8859-2', 28595: 'iso8859-5',
+              28597: 'iso8859-7', 28599: 'iso8859-9', 28605: 'iso8859-15', 20866: 'koi8-r',
+              21866: 'koi8-u', 50220: 'iso2022-jp', 51932: 'euc-jp', 51949: 'euc-kr',
+              54936: 'gb18030', 52936: 'hz', 65000: 'utf-7', 65001: 'utf-8'}
+
+
+def _decode_html(data, codepage=None):
+    """PidTagBodyHtml as text: by PidTagInternetCodepage ([MS-OXPROPS] 2.747) when the item
+    stores one Python can decode with, else UTF-8, else cp1252 with replacement."""
     if isinstance(data, str):
         return data
+    if isinstance(codepage, int):
+        try:
+            return data.decode(_CODEPAGES.get(codepage, 'cp%d' % codepage))
+        except (LookupError, UnicodeDecodeError):
+            pass
     try:
         return data.decode('utf-8')
     except UnicodeDecodeError:
@@ -164,7 +178,7 @@ def _shown(text):
 # kind -> (button label, how to read it, how to show it, file extension)
 _BODY_KINDS = (
     ('text', 'Plain text (0x1000)', lambda m: m.body(), _shown, '.txt'),
-    ('html', 'HTML source (0x1013)', lambda m: m.html_body(), lambda v: _shown(_decode_html(v)), '.html'),
+    ('html', 'HTML source (0x1013)', lambda m: m.html_body(), None, '.html'),
     ('rtf', 'RTF source (0x1009, decompressed)', lambda m: m.rtf_body(),
      lambda v: _shown(v.decode('latin-1')), '.rtf'),
 )
@@ -183,7 +197,14 @@ def item_bodies(message):
         if value is None:
             continue
         raw = value.encode('utf-8') if isinstance(value, str) else bytes(value)
-        out[kind] = (show(value), raw)
+        if kind == 'html':
+            try:
+                codepage = message.get(0x3FDE)  # PidTagInternetCodepage
+            except pstprobe.DAMAGE_ERRORS:
+                codepage = None
+            out[kind] = (_shown(_decode_html(value, codepage)), raw)
+        else:
+            out[kind] = (show(value), raw)
     return out
 
 

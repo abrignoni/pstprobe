@@ -229,11 +229,17 @@ class RtfTests(unittest.TestCase):
         bad_crc[12] ^= 1
         bad_type = bytearray(RTF_EXAMPLE_1)
         bad_type[8:12] = b"ABCD"
-        padded = bytearray(RTF_EXAMPLE_1) + b"\0"  # padding counts in the CRC, 2.2.3
+        # a byte of PADDING inside COMPSIZE counts in the CRC (2.2.3), so the CRC no longer matches
+        padded = bytearray(RTF_EXAMPLE_1) + b"\0"
+        struct.pack_into("<I", padded, 0, len(padded) - 4)
+        too_big = bytearray(RTF_EXAMPLE_1)
+        struct.pack_into("<I", too_big, 0, len(too_big))  # COMPSIZE past the end of the value
         for raw in (bytes(bad_crc), bytes(bad_type), RTF_EXAMPLE_1[:-3], RTF_EXAMPLE_1[:10],
-                    bytes(padded)):
+                    bytes(padded), bytes(too_big)):
             with self.assertRaises(P.CorruptError):
                 P.decompress_rtf(raw)
+        # bytes after 4 + COMPSIZE are outside the stream and change nothing
+        self.assertEqual(P.decompress_rtf(RTF_EXAMPLE_1 + b"\0\0"), P.decompress_rtf(RTF_EXAMPLE_1))
 
     def test_message_rtf_body_and_export(self):
         import json
@@ -277,6 +283,37 @@ class ExportTests(unittest.TestCase):
                 self.assertEqual(f.read(), facts["att_payload"])
             with open(os.path.join(inbox, "folder.json"), encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["path"], "/Inbox")
+
+    def test_second_export_to_the_same_folder_is_refused_and_changes_nothing(self):
+        import tempfile
+        raw, _ = pstbuilder.build_sample("unicode", P.CRYPT_PERMUTE, rtf=RTF_EXAMPLE_1)
+
+        def snapshot(top):
+            out = {}
+            for base, _dirs, files in os.walk(top):
+                for name in files:
+                    with open(os.path.join(base, name), "rb") as f:
+                        out[os.path.relpath(os.path.join(base, name), top)] = f.read()
+            return out
+        with tempfile.TemporaryDirectory() as d, P.open_pst(io.BytesIO(raw)) as pst:
+            P.export_folder(pst, pst.root_folder(), d, recursive=True)
+            before = snapshot(d)
+            for recursive in (True, False):
+                with self.assertRaises(FileExistsError):
+                    P.export_folder(pst, pst.root_folder(), d, recursive=recursive)
+                self.assertEqual(snapshot(d), before)
+            # the CLI says so and exits 1
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(P.main(["export", "--recursive", "-o", d, self._write(d, raw)]), 1)
+            self.assertIn("will not replace", err.getvalue())
+
+    @staticmethod
+    def _write(d, raw):
+        path = os.path.join(d, "in.pst")  # inside the temporary folder, removed with it
+        with open(path, "wb") as f:
+            f.write(raw)
+        return path
 
     def test_attachments_of_attached_items_do_not_collide(self):
         import json

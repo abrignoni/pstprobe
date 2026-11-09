@@ -3,8 +3,8 @@
     python tools/smoke_binary.py --cli dist/pstprobe [--gui PATH] [--version 0.2.0] [FILE ...]
 
 The CLI binary must print the expected version and give the same output as `python pstprobe.py`
-for info, folders, items, props and export, on a PST built by tests/pstbuilder.py and on any
-FILE given. The window binary must pass --selfcheck on the built PST. A windowed Windows build
+for info, folders, items, props, body (text, html and rtf, for up to 25 items) and export, on a
+PST built by tests/pstbuilder.py (with a compressed RTF body) and on any FILE given. The window binary must pass --selfcheck on the built PST. A windowed Windows build
 has no stdout, so only its exit code is checked there. Run it from the repository root; on
 Linux, run it under a virtual display.
 """
@@ -35,6 +35,16 @@ def run(cmd):
     return done.returncode, done.stdout.decode("utf-8", "replace"), done.stderr.decode("utf-8", "replace")
 
 
+def run_raw(cmd):
+    done = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, check=False)
+    return done.returncode, done.stdout
+
+
+# [MS-OXRTFCP] 3.1.1: the specification's first worked example, 43 bytes decompressed.
+RTF_EXAMPLE_1 = bytes.fromhex("2d0000002b0000004c5a4675f1c5c7a703000a007263706731323542320af320"
+                              "68656c090020627705b06c647d0a800fa0")
+
+
 def tree(folder):
     """Every file below folder with its bytes, for comparing two exports."""
     out = {}
@@ -51,6 +61,16 @@ def compare(source, binary, path, label, work):
         want, got = run(source + sub), run(binary + sub)
         check(want[0] == 0 and got == want, "%s: %s matches the source%s" % (
             label, sub[0], "" if got == want else " (exit %d vs %d; %s)" % (got[0], want[0], got[2].strip()[-300:])))
+    nids = [json.loads(line)["nid"] for line in run(source + ["items", path])[1].splitlines()
+            if line.startswith("{")][:25]
+    same, tried = 0, 0
+    for nid in nids:
+        for fmt in ("text", "html", "rtf"):
+            sub = ["body", path, str(nid), "--format", fmt]
+            tried += 1
+            same += run_raw(source + sub) == run_raw(binary + sub)
+    check(same == tried, "%s: body matches the source for %d of %d (item, format) pairs"
+          % (label, same, tried))
     a, b = os.path.join(work, label + "-src"), os.path.join(work, label + "-bin")
     want = run(source + ["export", path, "--recursive", "-o", a])
     got = run(binary + ["export", path, "--recursive", "-o", b])
@@ -70,7 +90,7 @@ def main():
     with tempfile.TemporaryDirectory() as work:
         sample = os.path.join(work, "sample.pst")
         with open(sample, "wb") as handle:
-            handle.write(pstbuilder.build_sample("unicode", 1)[0])
+            handle.write(pstbuilder.build_sample("unicode", 1, rtf=RTF_EXAMPLE_1)[0])
         code, out, err = run(binary + ["--version"])
         expected = run(source + ["--version"])[1].strip()
         check(code == 0 and out.strip() == expected, "--version prints %r (got %r%s)" % (expected, out.strip(), err.strip()))
@@ -85,7 +105,9 @@ def main():
             if out.strip():
                 report = json.loads(out)
                 check(report.get("window") == "built" and report.get("items_shown") == 1
-                      and report.get("attachment_files_saved") == 1, "window loaded the file: %s" % report)
+                      and report.get("attachment_files_saved") == 1
+                      and report.get("bodies_shown") == ["rtf"] and report.get("body_bytes_saved") == 43,
+                      "window loaded the file: %s" % report)
             else:
                 print("note  the window printed nothing (a windowed Windows build has no stdout)")
             for path in args.files:

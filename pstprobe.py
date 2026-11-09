@@ -26,6 +26,7 @@ which is LGPL, or from any other PST implementation. This file is MIT.
 
 import argparse
 import datetime
+import errno
 import json
 import os
 import re
@@ -1311,7 +1312,11 @@ def decompress_rtf(data):
         return bytes(data[16:])
     if comptype != _RTF_COMPRESSED:
         raise CorruptError("compressed RTF has COMPTYPE 0x%08x, neither LZFu nor MELA" % comptype)
-    contents = memoryview(data)[16:]
+    # COMPSIZE counts CONTENTS plus the 12 header bytes after it (2.1.3.1.1), so CONTENTS
+    # ends at 4 + COMPSIZE. Bytes past that are not part of the stream.
+    if compsize < 12 or 4 + compsize > len(data):
+        raise CorruptError("compressed RTF COMPSIZE %d does not fit its %d bytes" % (compsize, len(data)))
+    contents = memoryview(data)[16:4 + compsize]
     n = len(contents)
     dictionary = bytearray(4096)
     dictionary[:207] = _RTF_PRELOAD
@@ -1687,10 +1692,14 @@ def export_folder(pst, folder, outdir, recursive=False, cancel=None, progress=No
 
     def one(f, target):
         os.makedirs(target, exist_ok=True)
+        listing = os.path.join(target, "items.jsonl")
+        if os.path.exists(listing):
+            # an earlier export is there; refuse before anything is written over it
+            raise FileExistsError(errno.EEXIST, "an export is already there", listing)
         att_dir = os.path.join(target, "attachments")
         body_dir = os.path.join(target, "bodies")
         counts["folders"] += 1
-        with open(os.path.join(target, "items.jsonl"), "w", encoding="utf-8", newline="\n") as out:
+        with open(listing, "x", encoding="utf-8", newline="\n") as out:
             for nid in f.message_nids():
                 if cancel is not None and cancel():
                     raise PSTError("cancelled")
@@ -1718,7 +1727,7 @@ def export_folder(pst, folder, outdir, recursive=False, cancel=None, progress=No
                     progress(counts)
         if os.path.isdir(att_dir) and not os.listdir(att_dir):
             os.rmdir(att_dir)
-        with open(os.path.join(target, "folder.json"), "w", encoding="utf-8") as out:
+        with open(os.path.join(target, "folder.json"), "x", encoding="utf-8") as out:
             json.dump({"nid": f.nid, "path": f.path, "container_class": jsonable(f.container_class),
                        "properties": properties_record(f.pc, pst)}, out, ensure_ascii=False, indent=1)
         if recursive:

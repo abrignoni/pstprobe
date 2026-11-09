@@ -67,11 +67,15 @@ class Dialogs:
 
 
 def tree_listing(top):
+    """(relative path, size, SHA-256) of every file below top."""
+    import hashlib
     out = []
     for base, _dirs, files in os.walk(top):
         for name in files:
             path = os.path.join(base, name)
-            out.append((os.path.relpath(path, top), os.path.getsize(path)))
+            with open(path, "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+            out.append((os.path.relpath(path, top), os.path.getsize(path), digest))
     return sorted(out)
 
 
@@ -372,9 +376,19 @@ class Exercise:
             self.idle()
             direct = self.tmp_path("direct%d_%s" % (index, label.replace(" ", "")), "x")[:-2]
             pstprobe.export_folder(pst, folder, direct, recursive)
-            self.check(out is not None and tree_listing(out) == tree_listing(direct),
+            first = tree_listing(out) if out else None
+            self.check(out is not None and first == tree_listing(direct),
                        "export of the %s differs from export_folder" % label)
             self.check(str(self.w.status.cget("text")).startswith("Exported"), "export status")
+            # the same export again, into the same folder: refused, the first left as it was
+            errors = len([k for k, _t in self.d.shown if k == "showerror"])
+            self.d.answers.append(target)
+            self.w.export_dialog(recursive)
+            self.idle()
+            self.check(len([k for k, _t in self.d.shown if k == "showerror"]) == errors + 1,
+                       "second export of the %s into the same folder was not refused" % label)
+            self.check(out is not None and tree_listing(out) == first,
+                       "second export of the %s changed the first" % label)
 
     def check_shortcuts_and_dialogs(self):
         mod = gui._MOD  # pylint: disable=protected-access
@@ -388,22 +402,29 @@ class Exercise:
         self.w.about()
         self.w.shortcuts_help()
         self.check(len(self.d.shown) == before + 2, "about and shortcuts dialogs")
-        # busy guard and cancel: a whole-file export, cancelled at once
-        target = self.tmp_path("cancel", "x")[:-2]
+        # busy guard and cancel: a whole-file export started while this thread holds the
+        # reader's lock, so the export is certain to be running (blocked on its first read)
+        # when the busy guard and Esc are tried; it must stop at its next item.
+        target = self.tmp_path("cancel%d" % len(self.report["files"]), "x")[:-2]
         os.makedirs(target, exist_ok=True)
         top = self.w.tree.get_children("")[0]
         self.select_folder(top)
+        has_items = any(f.message_nids() for f in self.w.pst.walk_folders())
         self.d.answers.append(target)
-        self.w.export_dialog(True)
-        if self.w.busy:
+        with self.w.pst._lock:  # pylint: disable=protected-access
+            self.w.export_dialog(True)
+            self.check(self.w.busy, "export did not start")
             self.w.show_page(0)
             self.check(str(self.w.status.cget("text")).startswith("Busy"), "busy guard")
             self.w.items.event_generate("<Escape>")
             self.root.update()
+            self.check(self.w.cancel_flag.is_set(), "Esc did not set cancel")
         self.idle()
         status = str(self.w.status.cget("text"))
-        self.check(status.startswith("Cancelled") or status.startswith("Exported"),
-                   "status after cancel: %s" % status[:40])
+        want = "Cancelled" if has_items else "Exported"
+        self.check(status.startswith(want), "status after cancel is %r, expected %s"
+                   % (status[:40], want))
+        self.report["cancelled"] = self.report.get("cancelled", 0) + status.startswith("Cancelled")
 
     # -- damaged inputs and close -------------------------------------------------------
 

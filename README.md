@@ -85,7 +85,8 @@ in the item's line as `rtf_file`), and the file attachments under `attachments/`
 `<item NID>_<attachment NID>_<stored name>`. An attachment of an attached item adds the
 attached item's attachment NID to the chain (`<item NID>_<NID>_<NID>_<stored name>`),
 because attachment NIDs are local to the item that holds them. A file that already exists
-is never replaced: the write stops with an error. `extract` writes every file attachment
+is never replaced: the write stops with an error, and an export into a folder that already
+holds an export (its `items.jsonl`) is refused before anything is written. `extract` writes every file attachment
 of the whole file, those of attached items included, with the same names.
 
 Property names come from `pstprobe_names.py`, generated from [MS-OXPROPS] v20250520 by
@@ -104,7 +105,8 @@ each folder's item count. On the right are the selected folder's items, 500 to a
 with their delivery and modification times (UTC) first. Below them, tabs show the
 selected item's properties with their names, its recipients, its attachments and its
 body: the plain text, the HTML source or the RTF source (decompressed), whichever the item
-stores, shown as text and never rendered. NUL characters are left out of the shown text
+stores, shown as text and never rendered (HTML decoded by the item's PidTagInternetCodepage
+when Python knows it, else as UTF-8, else as cp1252). NUL characters are left out of the shown text
 (Tk drops them); Save Body writes the stored bytes. It saves a body, one attachment, all
 of an item's attachments, or exports a
 folder (with or without its subfolders) using the same code as `extract` and `export`.
@@ -222,11 +224,13 @@ the specification's two worked examples. (Its second example prints the result a
 `tools/gui_exercise.py` drives the window itself, with Tk's event loop running: it opens
 each file, expands every folder, shows every page, checks the tabs of a sample of items
 against the reader, switches bodies, sorts, copies, saves and exports (comparing the
-files with `export_folder`), refuses a second save to the same name, cancels a task, and
-opens a damaged copy and a file that is not a PST. On 24 files (the Outlook PSTs, the
-CFReDS OST and the public test files) it ran 4,673 checks with no failure on macOS 27
-(Python 3.12, Tk 8.6), Windows 11 on ARM (Python 3.11, Tk 8.6) and Ubuntu 26.04 (Python
-3.14, Tk 8.6).
+files with `export_folder`), refuses a second save to the same name, cancels a task,
+refuses a second export into the same folder (leaving the first byte for byte as it was),
+and opens a damaged copy and a file that is not a PST. Cancel is tried while the export is
+held at its first read, so it is reached on every file that has items. On 24 files (23
+distinct: the Outlook PSTs, the CFReDS OST and the public test files) it ran 4,809 checks
+with no failure on each of macOS 27 (Python 3.12, Tk 8.6), Windows 11 on ARM (Python 3.11,
+Tk 8.6) and Ubuntu 26.04 (Python 3.14, Tk 8.6).
 
 The tests (`python3 -m unittest discover -s tests`) need no data and no packages.
 
