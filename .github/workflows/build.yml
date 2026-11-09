@@ -58,11 +58,16 @@ jobs:
       - name: Tk and a virtual display
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y tk xvfb
+      # The binaries are built and checked before the release is published, so a tag may have
+      # no release yet; once it has one, its files must match the checksums it lists.
       - name: The tag's files match its published checksums
         if: inputs.tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if ! gh release view "${{ inputs.tag }}" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "no published release for ${{ inputs.tag }} yet"; exit 0
+          fi
           gh release download "${{ inputs.tag }}" -R "${{ github.repository }}" -p SHA256SUMS.txt -D _sums
           python - <<'PY'
           import hashlib
