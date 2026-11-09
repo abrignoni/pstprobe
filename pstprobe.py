@@ -240,6 +240,7 @@ PS_PUBLIC_STRINGS = uuid.UUID("00020329-0000-0000-c000-000000000046")
 
 # Property identifiers used by the messaging helpers ([MS-OXPROPS]).
 PID_TAG_DISPLAY_NAME = 0x3001
+PID_TAG_PST_PASSWORD = 0x67FF
 PID_TAG_CONTENT_COUNT = 0x3602
 PID_TAG_CONTENT_UNREAD_COUNT = 0x3603
 PID_TAG_SUBFOLDERS = 0x360A
@@ -806,7 +807,28 @@ class PSTFile:
             "header_eof": self.file_eof,
             "short_of_header_eof": self.file_size < self.file_eof,
             "amap_valid": self.amap_valid,
+            **self.password(),
         }
+
+    def password(self):
+        """PidTagPstPassword of the message store, [MS-PST] 2.4.3.3.
+
+        The property holds a CRC-32 of the password, not the password, and the password does
+        not protect the data, so pstprobe reads the file either way. The specification says
+        a nonzero value means a password is set and that readers MUST enforce it; pstprobe
+        reports it instead. Every OST read so far stores 0xFFFFFFFF, and what that means in
+        an OST is not established, so `password_set` is None for an OST.
+        """
+        try:
+            store = self.message_store()
+            value = store.get(PID_TAG_PST_PASSWORD) if store is not None else None
+        except DAMAGE_ERRORS:
+            return {"password_crc32": None, "password_set": None}
+        if not isinstance(value, int):
+            return {"password_crc32": None, "password_set": None if self.is_ost else False}
+        value &= 0xFFFFFFFF
+        return {"password_crc32": "0x%08x" % value,
+                "password_set": None if self.is_ost else value != 0}
 
 
 class Node:

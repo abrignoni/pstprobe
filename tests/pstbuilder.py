@@ -275,7 +275,7 @@ def i32(v):
     return struct.pack("<i", v)
 
 
-def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False):
+def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False, password=None):
     """A store with a root folder, one child folder 'Inbox' holding one message that has
     two recipients, one file attachment of 20,000 bytes (a data tree) and one named
     property. Returns (bytes, facts)."""
@@ -291,7 +291,10 @@ def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False):
         (0x0004, P.PT_BINARY, b""),
     ])
     b.node(P.NID_NAME_TO_ID_MAP, nameid)
-    b.node(P.NID_MESSAGE_STORE, b.pc([(P.PID_TAG_DISPLAY_NAME, P.PT_UNICODE, u16("kd store"))]))
+    store = [(P.PID_TAG_DISPLAY_NAME, P.PT_UNICODE, u16("kd store"))]
+    if password is not None:
+        store.append((P.PID_TAG_PST_PASSWORD, P.PT_INT32, struct.pack("<I", password)))
+    b.node(P.NID_MESSAGE_STORE, b.pc(store))
 
     inbox = P.make_nid(P.NID_TYPE_NORMAL_FOLDER, 0x401)
     root = P.NID_ROOT_FOLDER

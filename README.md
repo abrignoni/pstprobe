@@ -120,6 +120,12 @@ testing. The binaries bundle Python 3.13 with Tk 8.6.
   `message.get_named(guid, lid_or_name)`.
 - A search folder's results name items that live in other folders. They are not
   returned by `messages()`; `search_result_nids()` lists them.
+- `info` reports PidTagPstPassword, the CRC-32 of a PST password ([MS-PST] 2.4.3.3), as
+  `password_crc32`, and `password_set` is true when it is nonzero. The password does not
+  protect the data, so the file is read either way: the specification says readers must
+  enforce it, and pstprobe reports it instead. Every OST read so far (five) stores
+  0xFFFFFFFF; what that means in an OST is not established, so `password_set` is null for
+  an OST. The window shows the same in its banner.
 - A structure that does not match the format raises `CorruptError` with the offset or
   node involved. `items` prints such an error on that item's line and goes on.
 

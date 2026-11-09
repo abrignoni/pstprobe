@@ -437,6 +437,12 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         if info['short_of_header_eof']:
             text += (f' The file is shorter than the {info["header_eof"]:,} bytes its header records: '
                      'data past the end is missing, not empty.')
+        if info.get('password_set'):
+            text += (f' A password is set (PidTagPstPassword {info["password_crc32"]}, a CRC-32 of '
+                     'it). It does not protect the data; the file is read without it.')
+        elif info.get('password_set') is None and info.get('password_crc32') not in (None, '0x00000000'):
+            text += (f' PidTagPstPassword is {info["password_crc32"]}; what that value means in '
+                     'an OST is not established.')
         self.banner.configure(text=text)
         top = self.tree.insert('', 'end', text='/ (root)', open=True)
         self.folders[top] = root

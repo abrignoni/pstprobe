@@ -140,6 +140,24 @@ class RefusalTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_password_reported_not_enforced(self):
+        raw, facts = pstbuilder.build_sample("unicode", P.CRYPT_PERMUTE, password=0xE61E9B0F)
+        with P.open_pst(io.BytesIO(raw)) as pst:
+            info = pst.info()
+            self.assertIs(info["password_set"], True)
+            self.assertEqual(info["password_crc32"], "0xe61e9b0f")
+            self.assertEqual([f.path for f in pst.walk_folders()], ["/", "/Inbox"])
+        for value, expect in ((0, False), (None, False)):
+            raw, _ = pstbuilder.build_sample("unicode", P.CRYPT_PERMUTE, password=value)
+            with P.open_pst(io.BytesIO(raw)) as pst:
+                self.assertIs(pst.info()["password_set"], expect)
+        raw, _ = pstbuilder.build_sample("unicode4k", P.CRYPT_NONE, True, password=0xFFFFFFFF)
+        with P.open_pst(io.BytesIO(raw)) as pst:
+            info = pst.info()
+            self.assertEqual(info["type"], "OST")
+            self.assertIsNone(info["password_set"])
+            self.assertEqual(info["password_crc32"], "0xffffffff")
+
     def test_info_and_items(self):
         import contextlib
         import json
