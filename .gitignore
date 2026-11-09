@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+
+# Mail stores and evidence never belong in this repository. The tests build their
+# own files in memory.
+*.pst
+*.ost
+*.PST
+*.OST
+*.E0[0-9]
+*.zip

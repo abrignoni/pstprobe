@@ -1,0 +1,136 @@
+# pstprobe
+
+A read-only reader for Outlook PST and OST files. One file, pure Python, standard
+library only. No compiler, no network, nothing to install.
+
+It opens a Personal Storage Table (`.pst`) or an Offline Storage Table (`.ost`) and
+reads its folders, the items in them (mail, contacts, appointments, tasks, notes,
+journal entries and the rest), their recipients and their attachments, including
+items attached to other items.
+
+```python
+import pstprobe
+
+with pstprobe.open_pst("mailbox.pst") as pst:
+    for folder in pst.walk_folders():
+        for message in folder.messages():
+            print(folder.path, message.message_class, message.subject)
+            for att in message.attachments():
+                print("   ", att.filename, att.data_size())
+```
+
+The file is read with seek and read, one node at a time, through small caches. A
+mailbox of several gigabytes is never loaded whole, and an attachment can be copied
+out in pieces with `Attachment.iter_data()`.
+
+## Why this exists
+
+The established library for this format is libpff, which is excellent and is LGPL,
+ships as a C extension, and needs a build or a wheel for each platform. This reader
+exists so an MIT-licensed tool can read a PST with no copyleft dependency and no
+install step: copy one file in and it works on Windows, macOS and Linux alike.
+
+Nothing here is derived from libpff or from any other PST implementation. It is
+written from Microsoft's published specification and one public format document,
+credited below.
+
+## What it reads
+
+| Variant | Header | Tested against |
+|---|---|---|
+| Unicode PST | wVer 23, 512-byte pages | A PST that Outlook (LTSC 2024) made and filled, and the tests' own files |
+| ANSI PST | wVer 14 or 15 | An ANSI PST that Outlook made, and the tests' own files |
+| Unicode OST, 4 KB pages | wVer 36, blocks compressed with zlib | The OST in NIST CFReDS "Data Leakage Case", and the tests' own files |
+| NDB_CRYPT_PERMUTE | bCryptMethod 0x01 | Both Outlook PSTs above |
+| NDB_CRYPT_CYCLIC | bCryptMethod 0x02 | The tests' own files only. No real file has been read |
+| Not encoded | bCryptMethod 0x00 | The CFReDS OST |
+
+A file encrypted with Windows Information Protection (bCryptMethod 0x10) is refused
+with an error that says so, because its content cannot be read without its key. So is
+a 4 KB-page file that is both encoded and compressed: no such file has been seen, and
+the order of the two steps is not established.
+
+"The tests' own files" are built in memory by `tests/pstbuilder.py`, which is written
+from the same layouts as the reader. They show the reader and that writer agree. That
+the reader agrees with Outlook rests on the real files above.
+
+## Command line
+
+```
+python3 pstprobe.py info     mailbox.pst      # format, encoding, node counts by type
+python3 pstprobe.py folders  mailbox.pst      # every folder: NID, item count, class, path
+python3 pstprobe.py items    mailbox.pst      # one JSON line per item
+python3 pstprobe.py items    --subjects mailbox.pst
+python3 pstprobe.py props    mailbox.pst 0x200044   # every property of one node
+python3 pstprobe.py extract  mailbox.pst -o attachments/
+```
+
+`items` gives each item's folder, NID, message class, recipient count and its
+attachments (method, PidTagAttachSize, and the size of the attached data, or, for an
+attached item, the same summary of that item).
+
+## How values are returned
+
+- Times (PtypTime) are timezone-aware `datetime` objects in UTC. A zero time is `None`.
+- Strings end at their terminating zero ([MS-OXCDATA] 2.11.1). In ANSI files Outlook
+  has been seen to store other bytes after the terminator; `PropertyContext.raw()`
+  returns the stored bytes, including those.
+- A PtypString value with an odd number of bytes cannot be UTF-16, so it is returned as
+  the stored `bytes`. Outlook has also been seen to store 8-bit text of even length under
+  the PtypString type (a search folder's container class, in the Outlook PST above).
+  That case cannot be told apart from real UTF-16 and decodes as unreadable text.
+- `Message.subject` drops the two-character prefix marker (SOH and a length) that a
+  stored subject can start with. `get(0x0037)` returns the subject as stored.
+- Named properties (IDs from 0x8000) are resolved through the store's name-to-ID map:
+  `message.get_named(guid, lid_or_name)`.
+- A search folder's results name items that live in other folders. They are not
+  returned by `messages()`; `search_result_nids()` lists them.
+- A structure that does not match the format raises `CorruptError` with the offset or
+  node involved. `items` prints such an error on that item's line and goes on.
+
+## What it does not do yet
+
+- Message bodies are returned as stored, by their stored type. Compressed RTF (PidTagRtfCompressed, LZFu) is not decompressed.
+- No recovery. Items that are no longer linked from a folder, and data in free space,
+  are not looked for. `info` counts every node in the node B-tree by type, so a
+  difference from the items the folders list is visible. In the Outlook PST above, a
+  mail deleted from Deleted Items was not among the file's message nodes; whether any
+  of it remains elsewhere in the file was not examined.
+- Page and block CRCs are not checked.
+- Personal address books (`.pab`) are accepted by signature and have not been tested.
+
+## Validation
+
+`tools/compare_libpff.py` compares this reader with libpff (libpff-python 20261030),
+run as a comparison oracle in a separate environment by `tools/oracle_dump.py`. On the
+three real files it reports no difference in folders, items per folder, recipients per
+item, attachments per item, or attachment data sizes:
+
+| File | Folders | Items | Recipients | Attachments |
+|---|---|---|---|---|
+| CFReDS Data Leakage OST (corpus key `cfreds_leakage_win7`) | 49 | 14 | 14 | 0 |
+| Outlook Unicode PST (corpus key `windows11_arm_outlook_pst_known_20261109`) | 24 | 19 | 6 | 2 |
+| Outlook ANSI PST (same corpus key) | 7 | 3 | 3 | 1 |
+
+`tools/known-data/check_known.py` checks the two Outlook PSTs against what was done to
+make them: the item counts per folder and class that Outlook reported, the SHA-256 of
+the attached file, the attached item, and the three appointments' start times.
+
+The tests (`python3 -m unittest discover -s tests`) need no data and no packages.
+
+## Sources
+
+- Microsoft, [MS-PST] "Outlook Personal Folders (.pst) File Format", v20250218
+  (revision 11.2): the header, B-trees, blocks, both encodings, the heap, BTH, property
+  and table contexts, and the messaging layer.
+- Joachim Metz, "Personal Folder File (PFF) file format specification", in
+  libyal/libpff under `documentation/` (GNU Free Documentation License): the layout of
+  the 4 KB-page OST format, which [MS-PST] does not describe. It was read for the
+  structure only; no text is copied. Two points were measured on a real OST instead:
+  a block's 24-byte trailer sits at the end of its 512-byte-aligned allocation, and a
+  compressed block is a zlib stream (header 0x78 0x9C), not raw deflate.
+- Microsoft, [MS-OXCDATA] for string termination and [MS-OXPROPS] for property IDs.
+
+## License
+
+MIT. See `LICENSE`.
