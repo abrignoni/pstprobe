@@ -781,6 +781,7 @@ class PSTFile:
             "wVerClient": self.ver_client,
             "crypt": CRYPT_NAMES.get(self.crypt_method, hex(self.crypt_method)),
             "header_eof": self.file_eof,
+            "short_of_header_eof": self.file_size < self.file_eof,
             "amap_valid": self.amap_valid,
         }
 
@@ -1382,6 +1383,9 @@ def _json_default(o):
 
 def _cmd_info(pst, args):
     info = pst.info()
+    if info["short_of_header_eof"]:
+        print("pstprobe: warning: the file is %d bytes, the header says %d; data past the end "
+              "is missing, not empty" % (pst.file_size, pst.file_eof), file=sys.stderr)
     info["nodes_by_type"] = pst.nid_census()
     store = pst.message_store()
     if store is not None:

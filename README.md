@@ -39,7 +39,7 @@ credited below.
 | Variant | Header | Tested against |
 |---|---|---|
 | Unicode PST | wVer 23, 512-byte pages | A PST that Outlook (LTSC 2024) made and filled, and the tests' own files |
-| ANSI PST | wVer 14 or 15 | An ANSI PST that Outlook made, and the tests' own files |
+| ANSI PST | wVer 14 or 15 | An ANSI PST (wVer 14) that Outlook made, and the tests' own files. No wVer 15 file has been seen |
 | Unicode OST, 4 KB pages | wVer 36, blocks compressed with zlib | The OST in NIST CFReDS "Data Leakage Case", and the tests' own files |
 | NDB_CRYPT_PERMUTE | bCryptMethod 0x01 | Both Outlook PSTs above |
 | NDB_CRYPT_CYCLIC | bCryptMethod 0x02 | The tests' own files only. No real file has been read |
@@ -104,7 +104,8 @@ attached item, the same summary of that item).
 `tools/compare_libpff.py` compares this reader with libpff (libpff-python 20261030),
 run as a comparison oracle in a separate environment by `tools/oracle_dump.py`. On the
 three real files it reports no difference in folders, items per folder, recipients per
-item, attachments per item, or attachment data sizes:
+item, attachments per item, or the data sizes of file attachments (attached items are
+compared by count only):
 
 | File | Folders | Items | Recipients | Attachments |
 |---|---|---|---|---|
@@ -128,8 +129,10 @@ The tests (`python3 -m unittest discover -s tests`) need no data and no packages
   the 4 KB-page OST format, which [MS-PST] does not describe. It was read for the
   structure only; no text is copied. Two points were measured on a real OST instead:
   a block's 24-byte trailer sits at the end of its 512-byte-aligned allocation, and a
-  compressed block is a zlib stream (header 0x78 0x9C), not raw deflate.
-- Microsoft, [MS-OXCDATA] for string termination and [MS-OXPROPS] for property IDs.
+  compressed block is a zlib stream (header 0x78 0x9C), not raw deflate. A block can
+  inflate past 8,192 bytes (26,644 bytes seen).
+- Microsoft, [MS-OXCDATA] v20250520, 2.11.1, for string termination, and [MS-OXPROPS]
+  for property IDs.
 
 ## License
 

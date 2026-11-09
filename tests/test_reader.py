@@ -87,6 +87,20 @@ class SampleTests(unittest.TestCase):
         self.assertIn(b"\x78\x9c", raw_c)
 
 
+class StructureTests(unittest.TestCase):
+    def test_bth_index_level_and_heap_over_two_blocks(self):
+        for kind in ("unicode", "ansi", "unicode4k"):
+            crypt = P.CRYPT_NONE if kind == "unicode4k" else P.CRYPT_PERMUTE
+            with self.subTest(kind=kind):
+                raw, expected = pstbuilder.build_wide_pc_sample(kind, crypt)
+                with P.open_pst(io.BytesIO(raw)) as pst:
+                    node = pst.node(P.NID_MESSAGE_STORE)
+                    self.assertEqual(len(node.blocks), 2)
+                    pc = P.PropertyContext(node)
+                    got = {pid: pc.get(pid) for pid in pc.props}
+                    self.assertEqual(got, expected)
+
+
 class RefusalTests(unittest.TestCase):
     def test_not_a_pst(self):
         with self.assertRaises(P.PSTError):

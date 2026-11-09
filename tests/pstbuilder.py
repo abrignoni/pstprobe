@@ -314,3 +314,75 @@ def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False):
         b.inflate.update(bid for bid in b.blocks if not bid & 2)
     facts = {"inbox": inbox, "msg": msg, "att_payload": att_payload, "guid_appt": guid_appt}
     return b.build(), facts
+
+
+class MultiHeap:
+    """A heap over several blocks. Block 0 starts with HNHDR, later blocks with
+    HNPAGEHDR ([MS-PST] 2.3.1.2, 2.3.1.3). Kept under 8 blocks, so no HNBITMAPHDR."""
+
+    def __init__(self, client_sig):
+        self.client_sig = client_sig
+        self.blocks = [[]]
+        self.user_root = 0
+
+    def new_block(self):
+        self.blocks.append([])
+
+    def alloc(self, data):
+        blk = len(self.blocks) - 1
+        self.blocks[blk].append(bytes(data))
+        return (blk << 16) | (len(self.blocks[blk]) << 5)
+
+    def build(self):
+        out = []
+        for i, allocs in enumerate(self.blocks):
+            if i == 0:
+                body = bytearray(struct.pack("<HBBI4s", 0, P.HN_SIG, self.client_sig, self.user_root, b"\0" * 4))
+            else:
+                body = bytearray(struct.pack("<H", 0))
+            offs = [len(body)]
+            for a in allocs:
+                body += a
+                offs.append(len(body))
+            if len(body) % 2:
+                body += b"\0"
+            ib = len(body)
+            body += struct.pack("<HH", len(allocs), 0) + struct.pack("<%dH" % len(offs), *offs)
+            struct.pack_into("<H", body, 0, ib)
+            out.append(bytes(body))
+        return out
+
+
+def build_wide_pc_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, nprops=300):
+    """A message store PC with nprops string properties, its BTH one index level deep,
+    and the heap split over two blocks held by an XBLOCK. Returns (bytes, {pid: text})."""
+    b = Builder(kind, crypt)
+    h = MultiHeap(P.CLIENT_SIG_PC)
+    expected = {}
+    recs = []
+    for i in range(nprops):
+        pid = 0x6000 + i
+        text = "kd value %04d" % i
+        expected[pid] = text
+        if i == nprops // 2:
+            h.new_block()
+        recs.append((pid, h.alloc(u16(text))))
+    # leaf chunks of 40 records, then one index level over them
+    leaves = []
+    for i in range(0, len(recs), 40):
+        chunk = recs[i:i + 40]
+        data = b"".join(struct.pack("<HHI", pid, P.PT_UNICODE, hid) for pid, hid in chunk)
+        leaves.append((chunk[0][0], h.alloc(data)))
+    index = b"".join(struct.pack("<HI", key, hid) for key, hid in leaves)
+    root = h.alloc(index)
+    h.user_root = h.alloc(struct.pack("<BBBBI", P.CLIENT_SIG_BTH, 2, 6, 1, root))
+    blocks = h.build()
+    leaf_bids = [b.data(x) for x in blocks]
+    n = b.L.id_size
+    fmt = "<I" if n == 4 else "<Q"
+    x = struct.pack("<BBHI", 1, 1, len(leaf_bids), sum(len(x) for x in blocks)) + \
+        b"".join(struct.pack(fmt, bid) for bid in leaf_bids)
+    xbid = b._bid(internal=True)
+    b.blocks[xbid] = x
+    b.nodes[P.NID_MESSAGE_STORE] = (xbid, 0, 0)
+    return b.build(), expected
