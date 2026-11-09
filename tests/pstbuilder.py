@@ -198,14 +198,35 @@ class Builder:
         else:
             bbt = [struct.pack("<QQHHI", b, ib, cb, 1, 0) for b, (ib, cb) in sorted(placed.items())]
             nbt = [struct.pack("<QQQII", nid, d, s, p, 0) for nid, (d, s, p) in sorted(self.nodes.items())]
-        bbt_ib = len(out)
-        out += self._leaf_page(bbt, P.PTYPE_BBT, 0x1000 | 2)
-        nbt_ib = len(out)
-        out += self._leaf_page(nbt, P.PTYPE_NBT, 0x1004 | 2)
+        bbt_ib = self._tree(out, bbt, P.PTYPE_BBT, 0x1000)
+        nbt_ib = self._tree(out, nbt, P.PTYPE_NBT, 0x2000)
         self._header(out, nbt_ib, bbt_ib)
         return bytes(out)
 
-    def _leaf_page(self, entries, ptype, bid):
+    def _tree(self, out, entries, ptype, page_bid):
+        """Leaf pages, plus one branch page over them when one leaf is not enough.
+        Returns the root page's offset."""
+        L = self.L
+        per = L.bt_meta // len(entries[0])
+        if len(entries) <= per:
+            ib = len(out)
+            out += self._leaf_page(entries, ptype, page_bid | 2)
+            return ib
+        n = L.id_size
+        key_fmt = "<I" if n == 4 else "<Q"
+        branch = []
+        for i in range(0, len(entries), per):
+            chunk = entries[i:i + per]
+            ib = len(out)
+            bid = (page_bid + 4 * (len(branch) + 1)) | 2
+            out += self._leaf_page(chunk, ptype, bid)
+            key = struct.unpack_from(key_fmt, chunk[0])[0]
+            branch.append(struct.pack("<III" if n == 4 else "<QQQ", key, bid, ib))
+        ib = len(out)
+        out += self._leaf_page(branch, ptype, page_bid | 2, level=1)
+        return ib
+
+    def _leaf_page(self, entries, ptype, bid, level=0):
         L = self.L
         cb_ent = len(entries[0])
         if len(entries) * cb_ent > L.bt_meta:
@@ -213,9 +234,9 @@ class Builder:
         page = bytearray(L.page_size)
         page[:len(entries) * cb_ent] = b"".join(entries)
         if L.bt_meta_wide:
-            struct.pack_into("<HHBB", page, L.bt_meta, len(entries), L.bt_meta // cb_ent, cb_ent, 0)
+            struct.pack_into("<HHBB", page, L.bt_meta, len(entries), L.bt_meta // cb_ent, cb_ent, level)
         else:
-            struct.pack_into("<BBBB", page, L.bt_meta, len(entries), L.bt_meta // cb_ent, cb_ent, 0)
+            struct.pack_into("<BBBB", page, L.bt_meta, len(entries), L.bt_meta // cb_ent, cb_ent, level)
         t = L.page_trailer
         if L.kind == "ansi":
             struct.pack_into("<BBHII", page, t, ptype, ptype, 0, bid, 0)
@@ -386,3 +407,46 @@ def build_wide_pc_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, nprops=300):
     b.blocks[xbid] = x
     b.nodes[P.NID_MESSAGE_STORE] = (xbid, 0, 0)
     return b.build(), expected
+
+
+def build_nested_sample(kind="unicode", crypt=P.CRYPT_PERMUTE):
+    """Two items in Inbox. Each has one attachment (local NID 0x25) that is an attached item,
+    and that item has one file attachment (also local NID 0x25) named same.txt. The two
+    same.txt files hold different bytes. Returns (bytes, {item NID: payload})."""
+    b = Builder(kind, crypt)
+    b.node(P.NID_MESSAGE_STORE, b.pc([(P.PID_TAG_DISPLAY_NAME, P.PT_UNICODE, u16("kd store"))]))
+    b.node(P.NID_NAME_TO_ID_MAP, b.pc([(0x0001, P.PT_INT32, i32(251))]))
+    root = P.NID_ROOT_FOLDER
+    inbox = P.make_nid(P.NID_TYPE_NORMAL_FOLDER, 0x401)
+    items = [P.make_nid(P.NID_TYPE_NORMAL_MESSAGE, 0x10001), P.make_nid(P.NID_TYPE_NORMAL_MESSAGE, 0x10002)]
+    b.node(root, b.pc([(P.PID_TAG_DISPLAY_NAME, P.PT_UNICODE, u16(""))]), parent=root)
+    b.node((root & ~0x1F) | P.NID_TYPE_HIERARCHY_TABLE,
+           b.tc([0x67F20003], [{0x67F20003: i32(inbox)}]))
+    b.node(inbox, b.pc([(P.PID_TAG_DISPLAY_NAME, P.PT_UNICODE, u16("Inbox"))]), parent=root)
+    b.node((inbox & ~0x1F) | P.NID_TYPE_CONTENTS_TABLE,
+           b.tc([0x67F20003], [{0x67F20003: i32(n)} for n in items]))
+    att = P.make_nid(P.NID_TYPE_ATTACHMENT, 1)        # 0x25, local to each item
+    embedded = P.make_nid(P.NID_TYPE_NORMAL_MESSAGE, 0x20)
+    data_nid = P.make_nid(P.NID_TYPE_LTP, 0x10)
+    payloads = {}
+    for n, item in enumerate(items):
+        payload = ("kd payload of item %d\n" % n).encode() * (n + 1)
+        payloads[item] = payload
+        inner_att_pc = b.pc([(P.PID_TAG_ATTACH_METHOD, P.PT_INT32, i32(1)),
+                             (P.PID_TAG_ATTACH_LONG_FILENAME, P.PT_UNICODE, u16("same.txt")),
+                             (P.PID_TAG_ATTACH_DATA_BINARY, P.PT_BINARY, payload)])
+        inner_table = b.tc([0x67F20003], [{0x67F20003: i32(att)}])
+        inner_sub = b.subnodes([(P.NID_ATTACHMENT_TABLE, b.data(inner_table), 0),
+                                (att, b.data(inner_att_pc), 0)])
+        inner_msg = b.pc([(P.PID_TAG_MESSAGE_CLASS, P.PT_UNICODE, u16("IPM.Note")),
+                          (P.PID_TAG_SUBJECT, P.PT_UNICODE, u16("inner %d" % n))])
+        outer_att_pc = b.pc([(P.PID_TAG_ATTACH_METHOD, P.PT_INT32, i32(5)),
+                             (P.PID_TAG_ATTACH_DATA_BINARY, P.PT_OBJECT, struct.pack("<II", embedded, 0))])
+        outer_att_sub = b.subnodes([(embedded, b.data(inner_msg), inner_sub)])
+        outer_table = b.tc([0x67F20003], [{0x67F20003: i32(att)}])
+        sub = b.subnodes([(P.NID_ATTACHMENT_TABLE, b.data(outer_table), 0),
+                          (att, b.data(outer_att_pc), outer_att_sub)])
+        b.node(item, b.pc([(P.PID_TAG_MESSAGE_CLASS, P.PT_UNICODE, u16("IPM.Note")),
+                           (P.PID_TAG_SUBJECT, P.PT_UNICODE, u16("outer %d" % n))]), sub=sub, parent=inbox)
+    del data_nid
+    return b.build(), payloads

@@ -56,6 +56,11 @@ class UnsupportedError(PSTError):
     """The file uses a variant this reader does not read."""
 
 
+# What reading a damaged structure can raise besides CorruptError: a field that points past
+# the bytes it was read from fails in struct or in indexing before a check can name it.
+DAMAGE_ERRORS = (PSTError, struct.error, IndexError, KeyError, ValueError, zlib.error)
+
+
 # ---------------------------------------------------------------------------
 # NDB_CRYPT_PERMUTE and NDB_CRYPT_CYCLIC tables, [MS-PST] section 5.1.
 # mpbbR is bytes 0-255, mpbbS 256-511, mpbbI 512-767. mpbbI is the inverse
@@ -372,7 +377,9 @@ class PSTFile:
             self._f = open(source, "rb")
             self._own = True
             self.path = os.fspath(source)
-        self._lock = threading.Lock()
+        # One lock for the file position and the caches, so a PSTFile can be read from
+        # several threads (the window reads on a worker and on its main thread).
+        self._lock = threading.RLock()
         self._f.seek(0, os.SEEK_END)
         self.file_size = self._f.tell()
         self._page_cache = _LRU(2048)
@@ -457,6 +464,10 @@ class PSTFile:
 
     # -- pages and B-trees, [MS-PST] 2.2.2.7
     def _page(self, ib, ptype):
+        with self._lock:
+            return self._page_unlocked(ib, ptype)
+
+    def _page_unlocked(self, ib, ptype):
         page = self._page_cache.get(ib)
         if page is None:
             L = self.layout
@@ -574,6 +585,10 @@ class PSTFile:
     # -- blocks, [MS-PST] 2.2.2.8
     def read_block(self, bid):
         """The data of one block, decoded and, for a 4 KB-page OST, inflated."""
+        with self._lock:
+            return self._read_block_unlocked(bid)
+
+    def _read_block_unlocked(self, bid):
         key = bid & ~1
         cached = self._block_cache.get(key)
         if cached is not None:
@@ -687,7 +702,11 @@ class PSTFile:
 
     # -- named properties, [MS-PST] 2.4.7
     def _load_nameid(self):
-        self._nameid = {}
+        found = {}
+        self._fill_nameid(found)
+        self._nameid = found
+
+    def _fill_nameid(self, found):
         node = self.node(NID_NAME_TO_ID_MAP)
         if node is None:
             return
@@ -713,9 +732,9 @@ class PSTFile:
                     name = strings[dw + 4:dw + 4 + n].decode("utf-16-le", "replace")
                 else:
                     name = None
-                self._nameid[0x8000 + idx] = (guid, name)
+                found[0x8000 + idx] = (guid, name)
             else:
-                self._nameid[0x8000 + idx] = (guid, dw)
+                found[0x8000 + idx] = (guid, dw)
 
     def named_property(self, prop_id):
         """(guid, LID or name) behind a property ID from 0x8000, or None."""
@@ -1439,25 +1458,43 @@ def safe_filename(name, fallback="attachment"):
     return name[:180]
 
 
-def attachment_file_name(message, attachment):
-    """item NID, attachment NID and the stored name, so two attachments never collide."""
-    return "%06x_%06x_%s" % (message.nid, attachment.nid, safe_filename(attachment.filename))
+def attachment_file_name(message, attachment, chain=None):
+    """The item's NID, the chain of attachment NIDs down to this attachment, and its stored
+    name. Attachment NIDs are local to an item, and an attached item's attachments are local
+    to it, so the chain is what keeps two names apart."""
+    prefix = chain if chain is not None else "%06x" % message.nid
+    return "%s_%06x_%s" % (prefix, attachment.nid, safe_filename(attachment.filename))
+
+
+def iter_file_attachments(message, chain=None, depth=0):
+    """(file name, Attachment) for every file attachment of an item and of the items attached
+    to it, at any depth up to 8."""
+    chain = chain if chain is not None else "%06x" % message.nid
+    for a in message.attachments():
+        if a.is_embedded_message:
+            em = a.embedded_message()
+            if em is not None and depth < 8:
+                yield from iter_file_attachments(em, "%s_%06x" % (chain, a.nid), depth + 1)
+        else:
+            yield attachment_file_name(message, a, chain), a
 
 
 def write_attachment(attachment, path):
-    """Copy an attachment's data to path in pieces. Returns the bytes written."""
+    """Copy an attachment's data to a new file at path, in pieces. Refuses to replace a file
+    that exists. Returns the bytes written."""
     written = 0
-    with open(path, "wb") as out:
+    with open(path, "xb") as out:
         for chunk in attachment.iter_data():
             out.write(chunk)
             written += len(chunk)
     return written
 
 
-def item_record(message, attachments_dir=None, rel_dir="attachments", depth=0):
+def item_record(message, attachments_dir=None, rel_dir="attachments", depth=0, chain=None):
     """One item as a dict: its properties, recipients and attachments. With attachments_dir,
     each file attachment is written there and its record names the file."""
     pst = message.pst
+    chain = chain if chain is not None else "%06x" % message.nid
     rec = OrderedDict()
     rec["nid"] = message.nid
     rec["message_class"] = message.message_class
@@ -1466,7 +1503,7 @@ def item_record(message, attachments_dir=None, rel_dir="attachments", depth=0):
     try:
         rec["recipients"] = [OrderedDict(("0x%04x" % k if isinstance(k, int) else k, jsonable(v))
                                          for k, v in r.items()) for r in message.recipients()]
-    except PSTError as exc:
+    except DAMAGE_ERRORS as exc:
         rec["recipients"] = "ERROR: %s" % exc
     atts = []
     try:
@@ -1480,18 +1517,19 @@ def item_record(message, attachments_dir=None, rel_dir="attachments", depth=0):
             try:
                 if a.is_embedded_message:
                     em = a.embedded_message()
-                    ad["embedded_item"] = item_record(em, attachments_dir, rel_dir, depth + 1) \
+                    ad["embedded_item"] = item_record(em, attachments_dir, rel_dir, depth + 1,
+                                                      "%s_%06x" % (chain, a.nid)) \
                         if em is not None and depth < 8 else None
                 else:
                     ad["data_size"] = a.data_size()
                     if attachments_dir is not None:
-                        name = attachment_file_name(message, a)
+                        name = attachment_file_name(message, a, chain)
                         write_attachment(a, os.path.join(attachments_dir, name))
                         ad["file"] = rel_dir + "/" + name
-            except PSTError as exc:
+            except DAMAGE_ERRORS as exc:
                 ad["error"] = str(exc)
             atts.append(ad)
-    except PSTError as exc:
+    except DAMAGE_ERRORS as exc:
         atts = "ERROR: %s" % exc
     rec["attachments"] = atts
     return rec
@@ -1521,6 +1559,11 @@ def export_folder(pst, folder, outdir, recursive=False, cancel=None, progress=No
                         rec = item_record(m, att_dir)
                         counts["attachments"] += _count_files(rec)
                 except PSTError as exc:
+                    if str(exc) == "cancelled":
+                        raise
+                    rec = {"nid": nid, "error": str(exc)}
+                    counts["errors"] += 1
+                except DAMAGE_ERRORS[1:] as exc:
                     rec = {"nid": nid, "error": str(exc)}
                     counts["errors"] += 1
                 out.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -1638,7 +1681,7 @@ def _cmd_items(pst, args):
                 d.update(_message_summary(m))
                 if args.subjects:
                     d["subject"] = m.subject
-            except PSTError as exc:
+            except DAMAGE_ERRORS as exc:
                 d = {"folder": f.path, "nid": nid, "error": str(exc)}
             print(json.dumps(d, default=_json_default, ensure_ascii=False))
 
@@ -1662,10 +1705,8 @@ def _cmd_extract(pst, args):
     count = 0
     for f in pst.walk_folders():
         for m in f.messages():
-            for a in m.attachments():
-                if a.is_embedded_message:
-                    continue
-                write_attachment(a, os.path.join(args.output, attachment_file_name(m, a)))
+            for name, a in iter_file_attachments(m):
+                write_attachment(a, os.path.join(args.output, name))
                 count += 1
     print("%d attachments written to %s" % (count, args.output))
 
@@ -1707,6 +1748,13 @@ def main(argv=None):
              "props": _cmd_props, "extract": _cmd_extract, "export": _cmd_export}[args.cmd](pst, args)
     except PSTError as exc:
         print("pstprobe: %s" % exc, file=sys.stderr)
+        return 1
+    except DAMAGE_ERRORS as exc:
+        print("pstprobe: a structure in the file is damaged (%s: %s)" % (type(exc).__name__, exc),
+              file=sys.stderr)
+        return 1
+    except FileExistsError as exc:
+        print("pstprobe: will not replace %s" % exc.filename, file=sys.stderr)
         return 1
     return 0
 

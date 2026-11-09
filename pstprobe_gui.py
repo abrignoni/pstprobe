@@ -101,7 +101,7 @@ def _text(value):
 def _time(message, pid):
     try:
         value = message.get(pid)
-    except pstprobe.PSTError:
+    except pstprobe.DAMAGE_ERRORS:
         return ''
     return value.strftime('%Y-%m-%d %H:%M:%S') if hasattr(value, 'strftime') else ''
 
@@ -110,11 +110,11 @@ def item_summary(message):
     """The row the item list shows for one item."""
     try:
         recipients = len(message.recipients())
-    except pstprobe.PSTError:
+    except pstprobe.DAMAGE_ERRORS:
         recipients = '?'
     try:
         attachments = len(message.attachment_nids())
-    except pstprobe.PSTError:
+    except pstprobe.DAMAGE_ERRORS:
         attachments = '?'
     return ([_time(message, pid) for pid, _ in _TIME_TAGS]
             + [message.message_class or '', _text(message.subject), recipients, attachments,
@@ -128,7 +128,7 @@ def item_detail(message):
              for pid, ptype, value in message.pc.items()]
     try:
         recipients = [[_text(r.get(pid)) for pid, _l, _w in _RECIPIENT_COLUMNS] for r in message.recipients()]
-    except pstprobe.PSTError as error:
+    except pstprobe.DAMAGE_ERRORS as error:
         recipients = [['error: %s' % error, '', '', '', '']]
     attachments = []
     try:
@@ -140,11 +140,11 @@ def item_detail(message):
             else:
                 kind, size, name = 'file', a.data_size(), _text(a.filename)
             attachments.append(['0x%x' % a.nid, name, kind, _text(a.method), _text(a.size), _text(size)])
-    except pstprobe.PSTError as error:
+    except pstprobe.DAMAGE_ERRORS as error:
         attachments.append(['', 'error: %s' % error, '', '', '', ''])
     try:
         body = message.get(0x1000)
-    except pstprobe.PSTError as error:
+    except pstprobe.DAMAGE_ERRORS as error:
         body = 'error: %s' % error
     return {'props': props, 'recipients': recipients, 'attachments': attachments,
             'body': body if isinstance(body, str) else ''}
@@ -354,8 +354,8 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             self.set_status('Cancelling...')
 
     def _run(self, text, work, done):
-        """Run work() off the main thread; done(result) runs on it. Only one task at a time,
-        so the file is never read from two threads."""
+        """Run work() off the main thread; done(result) runs on it. One task at a time. The
+        main thread also reads the file (expanding a folder); the reader's lock makes that safe."""
         if self.busy:
             self.set_status('Busy: wait for the current task, or press Esc to cancel it.')
             return False
@@ -364,7 +364,9 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         def runner():
             try:
                 result = work()
-            except (pstprobe.PSTError, OSError, ValueError) as error:
+            except Exception as error:  # pylint: disable=broad-except
+                # anything else, a damaged file's struct.error included, must still end the
+                # task, or the window would stay busy for good
                 result = error
             self.jobs.put((done, result))
         threading.Thread(target=runner, daemon=True).start()
@@ -415,7 +417,7 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
     def _has_children(folder):
         try:
             return bool(folder.subfolder_nids())
-        except pstprobe.PSTError:
+        except pstprobe.DAMAGE_ERRORS:
             return False
 
     def show_file(self, result):
@@ -447,7 +449,7 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         label = folder.name or '(no name)'
         try:
             label += f'  ({len(folder.message_nids())})'
-        except pstprobe.PSTError:
+        except pstprobe.DAMAGE_ERRORS:
             label += '  (?)'
         if folder.is_search_folder:
             label += '  [search folder]'
@@ -476,7 +478,7 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             return
         try:
             self.items_nids = folder.message_nids()
-        except pstprobe.PSTError as error:
+        except pstprobe.DAMAGE_ERRORS as error:
             self.items_nids = []
             self.set_status(f'Error: {error}')
         self.show_page(0)
@@ -496,7 +498,7 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 try:
                     m = pst.message(nid)
                     rows.append(item_summary(m) if m else ['', '', '', 'node missing', '', '', '0x%x' % nid])
-                except pstprobe.PSTError as error:
+                except pstprobe.DAMAGE_ERRORS as error:
                     rows.append(['', '', '', f'error: {error}', '', '', '0x%x' % nid])
             return rows
 
@@ -578,11 +580,10 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
 
         def work():
             written = []
-            for a in m.attachments():
-                if not a.is_embedded_message:
-                    path = os.path.join(folder, pstprobe.attachment_file_name(m, a))
-                    pstprobe.write_attachment(a, path)
-                    written.append(path)
+            for name, a in pstprobe.iter_file_attachments(m):
+                path = os.path.join(folder, name)
+                pstprobe.write_attachment(a, path)
+                written.append(path)
             return written
         self._run('Saving attachments...', work,
                   lambda w: self.set_status(f'Saved {len(w)} attachment file(s) to {folder}'))

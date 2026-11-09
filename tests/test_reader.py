@@ -1,3 +1,4 @@
+import contextlib
 import datetime
 import io
 import os
@@ -191,6 +192,42 @@ class ExportTests(unittest.TestCase):
                 self.assertEqual(f.read(), facts["att_payload"])
             with open(os.path.join(inbox, "folder.json"), encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["path"], "/Inbox")
+
+    def test_attachments_of_attached_items_do_not_collide(self):
+        import json
+        import tempfile
+        raw, payloads = pstbuilder.build_nested_sample("unicode", P.CRYPT_PERMUTE)
+        with tempfile.TemporaryDirectory() as d:
+            with P.open_pst(io.BytesIO(raw)) as pst:
+                counts = P.export_folder(pst, pst.root_folder(), d, recursive=True)
+                names = [n for f in pst.walk_folders() for m in f.messages()
+                         for n, _a in P.iter_file_attachments(m)]
+            self.assertEqual(counts["attachments"], 2)
+            self.assertEqual(len(set(names)), 2)
+            inbox = [x for x in os.listdir(d) if x.startswith("Inbox_")][0]
+            with open(os.path.join(d, inbox, "items.jsonl"), encoding="utf-8") as f:
+                recs = [json.loads(line) for line in f]
+            for rec in recs:
+                inner = rec["attachments"][0]["embedded_item"]["attachments"][0]
+                with open(os.path.join(d, inbox, inner["file"]), "rb") as f:
+                    self.assertEqual(f.read(), payloads[rec["nid"]])
+            out = os.path.join(d, "x")
+            with contextlib.redirect_stdout(io.StringIO()):
+                path = os.path.join(d, "n.pst")
+                with open(path, "wb") as f:
+                    f.write(raw)
+                self.assertEqual(P.main(["extract", path, "-o", out]), 0)
+            self.assertEqual(len(os.listdir(out)), 2)
+
+    def test_write_attachment_refuses_to_replace(self):
+        import tempfile
+        raw, _ = pstbuilder.build_sample("unicode", P.CRYPT_PERMUTE)
+        with tempfile.TemporaryDirectory() as d, P.open_pst(io.BytesIO(raw)) as pst:
+            a = list(list(pst.walk_folders())[1].messages())[0].attachments()[0]
+            path = os.path.join(d, "a.bin")
+            P.write_attachment(a, path)
+            with self.assertRaises(FileExistsError):
+                P.write_attachment(a, path)
 
     def test_safe_filename(self):
         self.assertEqual(P.safe_filename('a/b\\c:d*?.txt'), "a_b_c_d__.txt")

@@ -76,8 +76,11 @@ folder of its own named from its display name and NID): `folder.json` with the f
 properties, `items.jsonl` with one line per item (every property with its
 [MS-OXPROPS] name, type and value, the recipients, and the attachments, attached items
 included), and the file attachments under `attachments/`, named
-`<item NID>_<attachment NID>_<stored name>` so two attachments never collide. `extract`
-writes the file attachments of the whole file with the same names.
+`<item NID>_<attachment NID>_<stored name>`. An attachment of an attached item adds the
+attached item's attachment NID to the chain (`<item NID>_<NID>_<NID>_<stored name>`),
+because attachment NIDs are local to the item that holds them. A file that already exists
+is never replaced: the write stops with an error. `extract` writes every file attachment
+of the whole file, those of attached items included, with the same names.
 
 Property names come from `pstprobe_names.py`, generated from [MS-OXPROPS] v20250520 by
 `tools/make_names.py` (545 PidTag and 365 PidLid names). Without that file beside it,
