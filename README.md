@@ -119,7 +119,7 @@ three-level node and block B-trees, a BTH with an index level, heaps and table r
 matrices that span blocks, XBLOCK and XXBLOCK data trees (a 10,000,000-byte attachment)
 and an SIBLOCK subnode tree (an item with 350 attachments). The other three files hold
 none of these. `items` reads all 1,222 items of it in about 0.1 s with a peak resident
-size of 32 MB on an M-series Mac. The largest file read so far is 16.8 MB (the CFReDS
+size of 32 MB on an Apple M2 Max. The largest file read so far is 16.8 MB (the CFReDS
 OST); a file of several gigabytes has not been tried.
 
 `tools/known-data/check_known.py` checks the two Outlook PSTs against what was done to
