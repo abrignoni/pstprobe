@@ -1,6 +1,7 @@
 """Check pstprobe against the known-data PSTs made on 2026-11-09.
 
     python3 tools/known-data/check_known.py /path/to/windows11_arm_outlook_pst_known_20261109.zip
+    python3 tools/known-data/check_known.py --stress /path/to/windows11_arm_outlook_pst_stress_known_20261109.zip
 
 The zip is the corpus key windows11_arm_outlook_pst_known_20261109 (Outlook LTSC 2024,
 a /PIM profile with no account). The expected values below are the counts Outlook
@@ -78,7 +79,44 @@ def check(name, data, exp):
     return not bad
 
 
+BIG_SHA256 = "6638db666458b55b703d7d312a7965f7fef18dc518a28154050cd283c9e0d39d"
+
+
+def check_stress(data):
+    """The stress key: 1,200 kd_bulk items, the 10,000,000-byte attachment, 350 attachments."""
+    bad = []
+    with pstprobe.open_pst(io.BytesIO(data)) as pst:
+        drafts = [f for f in pst.walk_folders() if f.name == "Drafts"]
+        msgs = list(drafts[0].messages()) if drafts else []
+        if len(msgs) != 1207:
+            bad.append("Drafts holds %d items" % len(msgs))
+        if sum(1 for m in msgs if (m.subject or "").startswith("kd_bulk_")) != 1200:
+            bad.append("kd_bulk items")
+        sizes = sorted(len(m.attachments()) for m in msgs)
+        if sizes[-1] != 350:
+            bad.append("largest attachment count %d" % sizes[-1])
+        for m in msgs:
+            for a in m.attachments():
+                if a.data_size() == 10000000:
+                    h = hashlib.sha256()
+                    for chunk in a.iter_data():
+                        h.update(chunk)
+                    if h.hexdigest() != BIG_SHA256:
+                        bad.append("10 MB attachment hash")
+                    break
+            else:
+                continue
+            break
+        else:
+            bad.append("10 MB attachment not found")
+    print("stress: %s" % ("ok" if not bad else "; ".join(bad)))
+    return not bad
+
+
 def main():
+    if sys.argv[1] == "--stress":
+        with zipfile.ZipFile(sys.argv[2]) as z:
+            return 0 if check_stress(z.read("kd_outlook/pst/Outlook Data File - kd_pim.pst")) else 1
     ok = True
     with zipfile.ZipFile(sys.argv[1]) as z:
         for name, exp in EXPECTED.items():

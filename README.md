@@ -112,10 +112,21 @@ compared by count only):
 | CFReDS Data Leakage OST (corpus key `cfreds_leakage_win7`) | 49 | 14 | 14 | 0 |
 | Outlook Unicode PST (corpus key `windows11_arm_outlook_pst_known_20261109`) | 24 | 19 | 6 | 2 |
 | Outlook ANSI PST (same corpus key) | 7 | 3 | 3 | 1 |
+| Outlook Unicode PST, larger (corpus key `windows11_arm_outlook_pst_stress_known_20261109`) | 24 | 1,222 | 6 | 353 |
+
+The larger PST (14.5 MB) is there for structure: `tools/structure_census.py` finds in it
+three-level node and block B-trees, a BTH with an index level, heaps and table row
+matrices that span blocks, XBLOCK and XXBLOCK data trees (a 10,000,000-byte attachment)
+and an SIBLOCK subnode tree (an item with 350 attachments). The other three files hold
+none of these. `items` reads all 1,222 items of it in about 0.1 s with a peak resident
+size of 32 MB on an M-series Mac. The largest file read so far is 16.8 MB (the CFReDS
+OST); a file of several gigabytes has not been tried.
 
 `tools/known-data/check_known.py` checks the two Outlook PSTs against what was done to
 make them: the item counts per folder and class that Outlook reported, the SHA-256 of
-the attached file, the attached item, and the three appointments' start times.
+the attached file, the attached item, and the three appointments' start times. With
+`--stress` it checks the larger PST: 1,207 items in Drafts, the 10 MB attachment's
+SHA-256 and the item with 350 attachments.
 
 The tests (`python3 -m unittest discover -s tests`) need no data and no packages.
 
