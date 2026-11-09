@@ -165,14 +165,33 @@ three-level node and block B-trees, a BTH with an index level, heaps and table r
 matrices that span blocks, XBLOCK and XXBLOCK data trees (a 10,000,000-byte attachment)
 and an SIBLOCK subnode tree (an item with 350 attachments). The other three files hold
 none of these. `items` reads all 1,222 items of it in about 0.1 s with a peak resident
-size of 32 MB on an Apple M2 Max. The largest file read so far is 16.8 MB (the CFReDS
-OST); a file of several gigabytes has not been tried.
+size of 32 MB on an Apple M2 Max.
+
+The Enron EDRM v2 set in PST form (171 Unicode PSTs, 83 GB, the modified release by
+Intellekt on Hugging Face; corpus key `enron_edrm_v2_pst_hf_20261109`) was read in full:
+
+- `tools/read_all.py` read all 1,226,178 items, 6,478,537 recipients and 453,832
+  attachments (64 GB of attachment data) with no read failure. Those item and attachment
+  totals equal the counts the release publishes. Every folder's item count equals its
+  PidTagContentCount, every item's recipient count equals the names in its display lists,
+  and every attachment read back its full data size. The largest file is 2.1 GB and took
+  41 s.
+- libpff could not read 26 of the files (it stops at a folder with a local descriptor size
+  error). On the other 145, `tools/compare_libpff.py` reports no difference. In those
+  files libpff could not open 12,912 items (all of which pstprobe read, with recipient
+  counts that match their display lists) and could not read the attachments of 1,212
+  more; those are not compared with libpff.
 
 `tools/known-data/check_known.py` checks the two Outlook PSTs against what was done to
 make them: the item counts per folder and class that Outlook reported, the SHA-256 of
 the attached file, the attached item, and the three appointments' start times. With
 `--stress` it checks the larger PST: 1,207 items in Drafts, the 10 MB attachment's
 SHA-256 and the item with 350 attachments.
+
+`tools/read_all.py` needs no other reader: it reads every item, recipient and attached
+file of a PST or OST and checks each against a second record in the file itself (the
+folder's PidTagContentCount, the attachment's data size and PidTagAttachSize, the item's
+display lists). It prints counts only.
 
 The tests (`python3 -m unittest discover -s tests`) need no data and no packages.
 

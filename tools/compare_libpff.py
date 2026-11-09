@@ -24,6 +24,7 @@ import pstprobe  # noqa: E402
 
 
 CONTENT_COUNT_MISMATCHES = []
+ITEM_FOLDER = {}
 
 
 def ours(path):
@@ -35,40 +36,68 @@ def ours(path):
             if not f.is_search_folder and f.content_count is not None and f.content_count != len(nids):
                 CONTENT_COUNT_MISMATCHES.append((f.nid, f.content_count, len(nids)))
             for nid in nids:
+                ITEM_FOLDER[nid] = f.nid
                 m = pst.message(nid)
                 if m is None:
                     items[nid] = "missing"
                     continue
                 atts = m.attachments()
-                sizes = []
+                sizes, over = [], 0
                 for a in atts:
-                    sizes.append(None if a.is_embedded_message else a.data_size())
+                    size = None if a.is_embedded_message else a.data_size()
+                    sizes.append(size)
+                    stored = a.pc.get(0x0E20)  # PidTagAttachSize
+                    if size is not None and isinstance(stored, int) and size > stored:
+                        over += 1
+                listed = 0
+                for tag in (0x0E04, 0x0E03, 0x0E02):  # PidTagDisplayTo, Cc, Bcc
+                    v = m.pc.get(tag)
+                    if isinstance(v, str):
+                        listed += len([x for x in v.split(";") if x.strip()])
                 items[nid] = {"recipients": len(m.recipients()), "attachments": len(atts),
-                              "sizes": sizes}
+                              "sizes": sizes, "listed": listed, "over": over}
     return folders, items
 
 
 def theirs(path):
-    folders, items = {}, {}
+    """Also returns, per folder NID, how many items libpff could not open at all."""
+    folders, items, unreadable = {}, {}, Counter()
     for f in json.load(open(path)):
         folders[f["id"]] = f["n_messages"]
         for m in f["messages"]:
+            if "error" in m:
+                unreadable[f["id"]] += 1
+                continue
             items[m.get("id")] = {"recipients": m["recipients"], "attachments": m["attachments"],
                                   "sizes": [a.get("size") for a in m.get("att", [])]}
-    return folders, items
+    return folders, items, unreadable
 
 
 def main():
     of, oi = ours(sys.argv[1])
-    tf, ti = theirs(sys.argv[2])
+    tf, ti, unreadable = theirs(sys.argv[2])
     diffs = 0
     not_compared = 0
+    libpff_unreadable = 0
+    libpff_no_attachments = 0
     for nid in sorted(set(of) | set(tf)):
         if of.get(nid) != tf.get(nid):
             diffs += 1
             print("folder 0x%x: pstprobe %s, libpff %s" % (nid, of.get(nid), tf.get(nid)))
     for nid in sorted(set(oi) | set(ti), key=lambda x: x or 0):
         a, b = oi.get(nid), ti.get(nid)
+        if b is None and a is not None and unreadable[ITEM_FOLDER.get(nid)] > 0:
+            # libpff could not open an item of this folder at all, so it has no NID for
+            # it to match. pstprobe's reading of it is not compared.
+            # The item's own PidTagDisplayTo/Cc/Bcc lists stand in for libpff here: a
+            # second record of its recipients. A name holding ";" would miscount, so a
+            # mismatch is printed for reading, not counted as a difference.
+            unreadable[ITEM_FOLDER[nid]] -= 1
+            libpff_unreadable += 1
+            if a["recipients"] != a["listed"]:
+                print("item 0x%x (libpff could not open): %d recipients, display lists name %d"
+                      % (nid, a["recipients"], a["listed"]))
+            continue
         if a is None or b is None:
             diffs += 1
             print("item 0x%x: pstprobe %s, libpff %s" % (nid, a, b))
@@ -84,6 +113,16 @@ def main():
         # order, libpff in another, and the file records no order of its own for them. An
         # attached item has no data size in pstprobe (None), so only file attachments count;
         # each of their sizes must be among libpff's.
+        if isinstance(b["attachments"], str):
+            # libpff could not read this item's attachments. PidTagAttachSize, the
+            # item's own record of each attachment's size (data plus overhead), stands
+            # in: an attached file's data must not be larger than it.
+            libpff_no_attachments += 1
+            if a["over"]:
+                diffs += 1
+                print("item 0x%x (libpff could not read attachments): %d attachments larger "
+                      "than their PidTagAttachSize" % (nid, a["over"]))
+            continue
         mine = Counter(x for x in a["sizes"] if x is not None)
         theirs_sizes = Counter(y for y in b["sizes"] if isinstance(y, int))
         if mine - theirs_sizes:
@@ -93,7 +132,15 @@ def main():
     for nid, stored, listed in CONTENT_COUNT_MISMATCHES:
         diffs += 1
         print("folder 0x%x: PidTagContentCount %d, contents table lists %d" % (nid, stored, listed))
+    for fnid, left in sorted(unreadable.items()):
+        if left:
+            diffs += 1
+            print("folder 0x%x: libpff could not open %d more items than pstprobe left unmatched"
+                  % (fnid, left))
     print("not compared (libpff gives no value for that item type): %d" % not_compared)
+    print("items libpff could not open (pstprobe read them; not compared): %d" % libpff_unreadable)
+    print("items whose attachments libpff could not read (checked against PidTagAttachSize): %d"
+          % libpff_no_attachments)
     print("folders: pstprobe %d, libpff %d; items: pstprobe %d, libpff %d; "
           "recipients: pstprobe %d, libpff %d; attachments: pstprobe %d, libpff %d; differences: %d"
           % (len(of), len(tf), len(oi), len(ti),
