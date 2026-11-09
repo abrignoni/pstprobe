@@ -1,0 +1,141 @@
+name: unsigned builds
+
+# Freezes the CLI and the window of a release tag with PyInstaller, checks each binary against
+# the source it was frozen from, and keeps the results as workflow artifacts. Nothing is
+# published from here: the binaries are attached to the release by hand after checking them.
+# The builds are not code signed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: release tag to build, e.g. v0.2.0
+        required: true
+  pull_request:
+    paths:
+      - '.github/workflows/build.yml'
+      - 'tools/smoke_binary.py'
+
+permissions:
+  contents: read
+
+env:
+  PYINSTALLER: pyinstaller==6.22.3
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: windows-latest, platform: windows-x64, arch: x64}
+          - {os: windows-11-arm, platform: windows-arm64, arch: arm64}
+          # python.org 3.14 on macOS ships Tk 9.0.3, which aborts the window; 3.13 has Tk 8.6
+          - {os: macos-latest, platform: macos-arm64, arch: arm64}
+          - {os: macos-15-intel, platform: macos-x64, arch: x64}
+          # 22.04 so the binaries run on older glibc than the newest runner image has
+          - {os: ubuntu-22.04, platform: linux-x64, arch: x64}
+          - {os: ubuntu-22.04-arm, platform: linux-arm64, arch: arm64}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Windows runners check out with CRLF line endings; freeze the bytes the tag holds
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+      # the smoke check comes from the workflow's own commit, which may be newer than the tag
+      - uses: actions/checkout@v4
+        with:
+          path: _workflow
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: ${{ matrix.arch }}
+      - name: Tk and a virtual display
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tk xvfb
+      - name: The tag's files match its published checksums
+        if: inputs.tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.tag }}" -R "${{ github.repository }}" -p SHA256SUMS.txt -D _sums
+          python - <<'PY'
+          import hashlib
+          for line in open('_sums/SHA256SUMS.txt'):
+              digest, name = line.split()
+              actual = hashlib.sha256(open(name, 'rb').read()).hexdigest()
+              print(name, 'ok' if actual == digest else 'DIFFERS')
+              assert actual == digest, name
+          PY
+      # a venv holding only PyInstaller, so nothing optional on the runner is frozen in
+      - name: Build environment
+        run: |
+          python -m venv _venv
+          if [ "$RUNNER_OS" = "Windows" ]; then echo "$PWD/_venv/Scripts" >> "$GITHUB_PATH"; else echo "$PWD/_venv/bin" >> "$GITHUB_PATH"; fi
+      - name: Freeze
+        run: |
+          python -m pip install --upgrade pip "$PYINSTALLER"
+          python -c "import sys, tkinter; print(sys.version, sys.platform, 'Tk', tkinter.TkVersion)"
+          # UTF-8 mode: a frozen binary ignores PYTHONIOENCODING, and on Windows its piped or
+          # redirected output would otherwise be cp1252
+          COMMON=(--noconfirm --clean --hidden-import pstprobe_names --python-option "X utf8")
+          python -m PyInstaller "${COMMON[@]}" --onefile --console --name pstprobe pstprobe.py
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python -m PyInstaller "${COMMON[@]}" --windowed --onedir --name pstprobe-window pstprobe_gui.py
+          else
+            python -m PyInstaller "${COMMON[@]}" --windowed --onefile --name pstprobe-window pstprobe_gui.py
+          fi
+          ls -la dist
+      - name: Check the binaries against the source
+        run: |
+          VERSION=$(python pstprobe.py --version | cut -d' ' -f2)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          case "$RUNNER_OS" in
+            Windows) CLI=dist/pstprobe.exe; GUI=dist/pstprobe-window.exe ;;
+            macOS) CLI=dist/pstprobe; GUI=dist/pstprobe-window.app/Contents/MacOS/pstprobe-window ;;
+            *) CLI=dist/pstprobe; GUI=dist/pstprobe-window ;;
+          esac
+          cp _workflow/tools/smoke_binary.py tools/smoke_binary.py
+          if [ "$RUNNER_OS" = "Linux" ]; then RUN="xvfb-run -a"; else RUN=""; fi
+          $RUN python tools/smoke_binary.py --cli "$CLI" --gui "$GUI" --version "$VERSION"
+        env:
+          PYTHONIOENCODING: utf-8
+      - name: Package
+        run: |
+          mkdir _out _notices
+          cp LICENSE _notices/LICENSE-pstprobe
+          python - <<'PY'
+          import glob, os, shutil, sys
+          found = sorted(set(glob.glob(os.path.join(sys.base_prefix, 'LICENSE*'))
+                             + glob.glob(os.path.join(sys.base_prefix, 'lib', 'python3*', 'LICENSE*'))
+                             + glob.glob(os.path.join(sys.base_prefix, 'Lib', 'LICENSE*'))))
+          print(found)
+          assert found, 'no Python licence found under ' + sys.base_prefix
+          shutil.copy(found[0], '_notices/LICENSE-python.txt')
+          PY
+          P="${{ matrix.platform }}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp dist/pstprobe.exe "_out/pstprobe-$VERSION-$P.exe"
+            cp dist/pstprobe-window.exe "_out/pstprobe-window-$VERSION-$P.exe"
+          else
+            cp dist/pstprobe "_out/pstprobe-$VERSION-$P"
+            chmod +x "_out/pstprobe-$VERSION-$P"
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              ditto -c -k --keepParent dist/pstprobe-window.app "_out/pstprobe-window-$VERSION-$P.app.zip"
+            else
+              cp dist/pstprobe-window "_out/pstprobe-window-$VERSION-$P"
+              chmod +x "_out/pstprobe-window-$VERSION-$P"
+            fi
+          fi
+          cp _notices/* _out/
+          ls -la _out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pstprobe-${{ matrix.platform }}
+          path: _out/*
+          if-no-files-found: error

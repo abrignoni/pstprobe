@@ -169,5 +169,70 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(f.read(), facts["att_payload"])
 
 
+class ExportTests(unittest.TestCase):
+    def test_export_folder_writes_items_and_attachments(self):
+        import json
+        import tempfile
+        raw, facts = pstbuilder.build_sample("unicode", P.CRYPT_PERMUTE)
+        with tempfile.TemporaryDirectory() as d:
+            with P.open_pst(io.BytesIO(raw)) as pst:
+                counts = P.export_folder(pst, pst.root_folder(), d, recursive=True)
+            self.assertEqual(counts, {"folders": 2, "items": 1, "attachments": 1, "errors": 0})
+            inbox = os.path.join(d, "Inbox_%06x" % facts["inbox"])
+            with open(os.path.join(inbox, "items.jsonl"), encoding="utf-8") as f:
+                rec = json.loads(f.readline())
+            self.assertEqual(rec["nid"], facts["msg"])
+            self.assertEqual(rec["subject"], "RE: kd subject")
+            self.assertEqual(rec["properties"]["0x0037"]["name"], "PidTagSubject")
+            self.assertEqual(rec["properties"]["0x8000"]["name"], "PidLidAppointmentStartWhole")
+            self.assertEqual(rec["properties"]["0x8000"]["value"], "2025-11-20T15:00:00+00:00")
+            self.assertEqual(len(rec["recipients"]), 2)
+            with open(os.path.join(inbox, rec["attachments"][0]["file"]), "rb") as f:
+                self.assertEqual(f.read(), facts["att_payload"])
+            with open(os.path.join(inbox, "folder.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["path"], "/Inbox")
+
+    def test_safe_filename(self):
+        self.assertEqual(P.safe_filename('a/b\\c:d*?.txt'), "a_b_c_d__.txt")
+        self.assertEqual(P.safe_filename("CON.txt"), "_CON.txt")
+        self.assertEqual(P.safe_filename(" .. "), "attachment")
+        self.assertEqual(P.safe_filename(None), "attachment")
+
+
+class WindowTest(unittest.TestCase):
+    """The window is built in a child process: one Tk root per process."""
+
+    def test_the_window_builds_and_shows_a_file(self):
+        import json
+        import subprocess
+        import tempfile
+        try:
+            import tkinter
+        except ImportError as error:
+            if os.environ.get("PSTPROBE_REQUIRE_GUI"):
+                raise
+            self.skipTest("no Tk: %s" % error)
+        if sys.platform == "darwin" and tkinter.TkVersion >= 9 and not os.environ.get("PSTPROBE_REQUIRE_GUI"):
+            # Tk 9.0.3 (python.org 3.14) aborts on macOS and pops a crash dialog on the desktop
+            self.skipTest("Tk 9 on macOS; run this test with a Python that ships Tk 8.6")
+        raw, _ = pstbuilder.build_sample("unicode", P.CRYPT_PERMUTE)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.pst")
+            with open(path, "wb") as f:
+                f.write(raw)
+            done = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "..", "pstprobe_gui.py"),
+                                   "--selfcheck", path], capture_output=True, text=True,
+                                  stdin=subprocess.DEVNULL, timeout=120, check=False)
+        if done.returncode != 0:
+            no_display = done.returncode > 0 and "TclError" in done.stderr and "display" in done.stderr
+            if no_display and not os.environ.get("PSTPROBE_REQUIRE_GUI"):
+                self.skipTest("no display")
+            self.fail("window self-check failed (%d): %s" % (done.returncode, done.stderr[-500:]))
+        self.assertEqual(json.loads(done.stdout), {
+            "window": "built", "menus": 4 + (sys.platform == "darwin"), "folders_shown": 2,
+            "items_shown": 1, "properties_shown": 3, "recipients_shown": 2, "attachments_shown": 1,
+            "attachment_files_saved": 1, "exported_items": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

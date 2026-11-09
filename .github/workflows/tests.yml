@@ -27,5 +27,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      # Standard library only: the tests run with nothing installed.
-      - run: python -m unittest discover -s tests -v
+      # Standard library only: the tests run with nothing installed. On Linux they run under a
+      # virtual display so the window's self-check runs too.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb && xvfb-run -a python -m unittest discover -s tests -v
+      - if: runner.os != 'Linux'
+        run: python -m unittest discover -s tests -v

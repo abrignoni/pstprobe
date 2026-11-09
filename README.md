@@ -63,11 +63,43 @@ python3 pstprobe.py items    mailbox.pst      # one JSON line per item
 python3 pstprobe.py items    --subjects mailbox.pst
 python3 pstprobe.py props    mailbox.pst 0x200044   # every property of one node
 python3 pstprobe.py extract  mailbox.pst -o attachments/
+python3 pstprobe.py export   mailbox.pst --folder 0x8082 -o out/      # one folder
+python3 pstprobe.py export   mailbox.pst --recursive -o out/          # every folder
 ```
 
 `items` gives each item's folder, NID, message class, recipient count and its
 attachments (method, PidTagAttachSize, and the size of the attached data, or, for an
 attached item, the same summary of that item).
+
+`export` writes, for the folder (and with `--recursive` each folder below it, in a
+folder of its own named from its display name and NID): `folder.json` with the folder's
+properties, `items.jsonl` with one line per item (every property with its
+[MS-OXPROPS] name, type and value, the recipients, and the attachments, attached items
+included), and the file attachments under `attachments/`, named
+`<item NID>_<attachment NID>_<stored name>` so two attachments never collide. `extract`
+writes the file attachments of the whole file with the same names.
+
+Property names come from `pstprobe_names.py`, generated from [MS-OXPROPS] v20250520 by
+`tools/make_names.py` (545 PidTag and 365 PidLid names). Without that file beside it,
+`pstprobe.py` still reads everything and shows property IDs only.
+
+## In a window
+
+```
+python3 pstprobe_gui.py [mailbox.pst]
+```
+
+`pstprobe_gui.py` is an optional tkinter window, standard library only, that needs
+`pstprobe.py` and `pstprobe_theme.py` beside it. On the left is the folder tree with
+each folder's item count. On the right are the selected folder's items, 500 to a page,
+with their delivery and modification times (UTC) first. Below them, tabs show the
+selected item's properties with their names, its recipients, its attachments and its
+plain-text body. It saves one attachment, all of an item's attachments, or exports a
+folder (with or without its subfolders) using the same code as `extract` and `export`.
+The file is opened read-only; the window writes nothing but its size and colour mode,
+in the user's settings folder. On a Mac, run it with a Python that ships Tk 8.6 (3.13 or
+earlier from python.org): Tk 9, in python.org's 3.14, has aborted tkinter windows in
+testing. The binaries bundle Python 3.13 with Tk 8.6.
 
 ## How values are returned
 
@@ -98,6 +130,17 @@ attached item, the same summary of that item).
   of it remains elsewhere in the file was not examined.
 - Page and block CRCs are not checked.
 - Personal address books (`.pab`) are accepted by signature and have not been tested.
+
+## Binaries
+
+Each release has unsigned builds of the command line and the window for Windows, macOS
+and Linux, x64 and arm64, made by `.github/workflows/build.yml` with PyInstaller. Nothing
+to install. They are not code signed: on Windows, SmartScreen may stop them (More info,
+then Run anyway); on macOS, allow them in System Settings, Privacy & Security, or run
+`xattr -dr com.apple.quarantine` on the file or the unzipped `.app`. On Linux, mark the
+file executable first. Each build is checked in CI against the source by
+`tools/smoke_binary.py`: the same output for `info`, `folders`, `items` and `props`, the
+same files from `export`, and the window's self-check.
 
 ## Validation
 

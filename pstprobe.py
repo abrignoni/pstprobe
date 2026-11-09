@@ -28,8 +28,10 @@ import argparse
 import datetime
 import json
 import os
+import re
 import struct
 import sys
+import threading
 import uuid
 import zlib
 from collections import OrderedDict
@@ -370,6 +372,7 @@ class PSTFile:
             self._f = open(source, "rb")
             self._own = True
             self.path = os.fspath(source)
+        self._lock = threading.Lock()
         self._f.seek(0, os.SEEK_END)
         self.file_size = self._f.tell()
         self._page_cache = _LRU(2048)
@@ -395,8 +398,9 @@ class PSTFile:
         self._f = None
 
     def _read(self, offset, size):
-        self._f.seek(offset)
-        data = self._f.read(size)
+        with self._lock:
+            self._f.seek(offset)
+            data = self._f.read(size)
         if len(data) != size:
             raise CorruptError("read of %d bytes at 0x%x returned %d (file is %d bytes)"
                                % (size, offset, len(data), self.file_size))
@@ -1361,6 +1365,204 @@ class Attachment:
         return Message(self.pst, sub)
 
 
+# ---------------------------------------------------------------------------
+# Names and export, shared by the command line and the window
+
+try:  # optional: property names from [MS-OXPROPS]; the reader works without it
+    import pstprobe_names as _names
+except ImportError:  # pragma: no cover
+    _names = None
+
+
+def property_name(pid, pst=None):
+    """The [MS-OXPROPS] canonical name of a property ID, when pstprobe_names.py is present.
+    IDs from 0x8000 are named properties: their name comes from the file's name-to-ID map."""
+    if pid >= 0x8000 and pst is not None:
+        named = pst.named_property(pid)
+        if named is None:
+            return None
+        guid, key = named
+        if isinstance(key, int):
+            if _names is not None and guid is not None:
+                n = _names.LIDS.get((str(guid), key))
+                if n:
+                    return n
+            return "{%s} 0x%04x" % (guid, key)
+        return "{%s} %s" % (guid, key)
+    if _names is not None:
+        n = _names.TAGS.get(pid)
+        if n:
+            return " / ".join(n)
+    return None
+
+
+def jsonable(value):
+    """A property value in a form json.dumps accepts: times as ISO 8601 UTC, bytes as hex."""
+    if isinstance(value, datetime.datetime):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, Exception):
+        return "ERROR: %s" % value
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    if isinstance(value, float) and value != value:  # NaN
+        return None
+    return value
+
+
+def properties_record(pc, pst=None, skip=()):
+    """Every property of a property context as {"0x0037": {"name", "type", "value"}}."""
+    out = OrderedDict()
+    for pid, ptype, value in pc.items():
+        if pid in skip:
+            continue
+        out["0x%04x" % pid] = {"name": property_name(pid, pst), "type": "0x%04x" % ptype,
+                               "value": jsonable(value)}
+    return out
+
+
+_UNSAFE = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
+_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | \
+    {"LPT%d" % i for i in range(1, 10)}
+
+
+def safe_filename(name, fallback="attachment"):
+    """A stored file name made safe to create on Windows, macOS and Linux."""
+    name = _UNSAFE.sub("_", name if isinstance(name, str) else "").strip(" .")
+    if not name:
+        name = fallback
+    if name.split(".")[0].upper() in _RESERVED:
+        name = "_" + name
+    return name[:180]
+
+
+def attachment_file_name(message, attachment):
+    """item NID, attachment NID and the stored name, so two attachments never collide."""
+    return "%06x_%06x_%s" % (message.nid, attachment.nid, safe_filename(attachment.filename))
+
+
+def write_attachment(attachment, path):
+    """Copy an attachment's data to path in pieces. Returns the bytes written."""
+    written = 0
+    with open(path, "wb") as out:
+        for chunk in attachment.iter_data():
+            out.write(chunk)
+            written += len(chunk)
+    return written
+
+
+def item_record(message, attachments_dir=None, rel_dir="attachments", depth=0):
+    """One item as a dict: its properties, recipients and attachments. With attachments_dir,
+    each file attachment is written there and its record names the file."""
+    pst = message.pst
+    rec = OrderedDict()
+    rec["nid"] = message.nid
+    rec["message_class"] = message.message_class
+    rec["subject"] = message.subject
+    rec["properties"] = properties_record(message.pc, pst)
+    try:
+        rec["recipients"] = [OrderedDict(("0x%04x" % k if isinstance(k, int) else k, jsonable(v))
+                                         for k, v in r.items()) for r in message.recipients()]
+    except PSTError as exc:
+        rec["recipients"] = "ERROR: %s" % exc
+    atts = []
+    try:
+        for a in message.attachments():
+            ad = OrderedDict()
+            ad["nid"] = a.nid
+            ad["filename"] = jsonable(a.filename)
+            ad["method"] = a.method
+            ad["attach_size"] = a.size
+            ad["properties"] = properties_record(a.pc, pst, skip=(PID_TAG_ATTACH_DATA_BINARY,))
+            try:
+                if a.is_embedded_message:
+                    em = a.embedded_message()
+                    ad["embedded_item"] = item_record(em, attachments_dir, rel_dir, depth + 1) \
+                        if em is not None and depth < 8 else None
+                else:
+                    ad["data_size"] = a.data_size()
+                    if attachments_dir is not None:
+                        name = attachment_file_name(message, a)
+                        write_attachment(a, os.path.join(attachments_dir, name))
+                        ad["file"] = rel_dir + "/" + name
+            except PSTError as exc:
+                ad["error"] = str(exc)
+            atts.append(ad)
+    except PSTError as exc:
+        atts = "ERROR: %s" % exc
+    rec["attachments"] = atts
+    return rec
+
+
+def export_folder(pst, folder, outdir, recursive=False, cancel=None, progress=None):
+    """Write a folder's items to outdir/items.jsonl (one item_record per line) and their file
+    attachments to outdir/attachments/. With recursive, each subfolder goes to a folder of its
+    own below, named from its display name and NID. Returns counts."""
+    counts = {"folders": 0, "items": 0, "attachments": 0, "errors": 0}
+
+    def one(f, target):
+        os.makedirs(target, exist_ok=True)
+        att_dir = os.path.join(target, "attachments")
+        counts["folders"] += 1
+        with open(os.path.join(target, "items.jsonl"), "w", encoding="utf-8", newline="\n") as out:
+            for nid in f.message_nids():
+                if cancel is not None and cancel():
+                    raise PSTError("cancelled")
+                try:
+                    m = pst.message(nid)
+                    if m is None:
+                        rec = {"nid": nid, "error": "node missing"}
+                        counts["errors"] += 1
+                    else:
+                        os.makedirs(att_dir, exist_ok=True)
+                        rec = item_record(m, att_dir)
+                        counts["attachments"] += _count_files(rec)
+                except PSTError as exc:
+                    rec = {"nid": nid, "error": str(exc)}
+                    counts["errors"] += 1
+                out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                counts["items"] += 1
+                if progress is not None:
+                    progress(counts)
+        if os.path.isdir(att_dir) and not os.listdir(att_dir):
+            os.rmdir(att_dir)
+        with open(os.path.join(target, "folder.json"), "w", encoding="utf-8") as out:
+            json.dump({"nid": f.nid, "path": f.path, "container_class": jsonable(f.container_class),
+                       "properties": properties_record(f.pc, pst)}, out, ensure_ascii=False, indent=1)
+        if recursive:
+            for sub in f.subfolders():
+                one(sub, os.path.join(target, "%s_%06x" % (safe_filename(sub.name, "folder"), sub.nid)))
+
+    one(folder, outdir)
+    return counts
+
+
+def _count_files(rec):
+    n = 0
+    for a in rec.get("attachments") or []:
+        if isinstance(a, dict):
+            if "file" in a:
+                n += 1
+            if a.get("embedded_item"):
+                n += _count_files(a["embedded_item"])
+    return n
+
+
+def find_folder(pst, spec):
+    """A folder by NID (0x8082 or 32898) or by path as `folders` prints it."""
+    try:
+        nid = int(spec, 0)
+    except ValueError:
+        nid = None
+    for f in pst.walk_folders():
+        if f.nid == nid or f.path == spec:
+            return f
+    return None
+
+
 def open_pst(source):
     """Open a PST or OST file by path or binary file object."""
     return PSTFile(source)
@@ -1448,8 +1650,8 @@ def _cmd_props(pst, args):
         raise PSTError("no node 0x%x" % nid)
     pc = PropertyContext(node)
     for pid, ptype, val in pc.items():
-        named = pst.named_property(pid) if pid >= 0x8000 else None
-        label = " %s" % (named,) if named else ""
+        name = property_name(pid, pst)
+        label = " %s" % name if name else ""
         if isinstance(val, (bytes, bytearray)) and len(val) > 64:
             val = val[:64].hex() + "... (%d bytes)" % len(val)
         print("0x%04x 0x%04x%s\t%s" % (pid, ptype, label, _json_default(val) if not isinstance(val, (int, float, str, bool, type(None))) else val))
@@ -1463,13 +1665,18 @@ def _cmd_extract(pst, args):
             for a in m.attachments():
                 if a.is_embedded_message:
                     continue
-                name = "%06x_%06x_%s" % (m.nid, a.nid, os.path.basename(a.filename or "attachment"))
-                target = os.path.join(args.output, name.replace(os.sep, "_"))
-                with open(target, "wb") as out:
-                    for chunk in a.iter_data():
-                        out.write(chunk)
+                write_attachment(a, os.path.join(args.output, attachment_file_name(m, a)))
                 count += 1
     print("%d attachments written to %s" % (count, args.output))
+
+
+def _cmd_export(pst, args):
+    folder = find_folder(pst, args.folder) if args.folder else pst.root_folder()
+    if folder is None:
+        raise PSTError("no folder %r; `folders` lists them" % args.folder)
+    counts = export_folder(pst, folder, args.output, recursive=args.recursive)
+    print("%(folders)d folders, %(items)d items, %(attachments)d attachment files, %(errors)d errors" % counts
+          + " written to %s" % args.output)
 
 
 def main(argv=None):
@@ -1480,20 +1687,24 @@ def main(argv=None):
                            ("folders", "folder tree with item counts"),
                            ("items", "one JSON line per item: class, recipients, attachments"),
                            ("props", "every property of one node"),
-                           ("extract", "write every file attachment to a folder")):
+                           ("extract", "write every file attachment to a folder"),
+                           ("export", "write a folder's items (JSON lines) and attachments")):
         s = sub.add_parser(name, help=helptext)
         s.add_argument("file")
         if name == "items":
             s.add_argument("--subjects", action="store_true", help="include subjects")
         if name == "props":
             s.add_argument("nid", help="node ID, e.g. 0x21 or 2097188")
-        if name == "extract":
+        if name in ("extract", "export"):
             s.add_argument("-o", "--output", required=True)
+        if name == "export":
+            s.add_argument("--folder", help="NID or path as `folders` prints it (default: the root)")
+            s.add_argument("--recursive", action="store_true", help="include subfolders")
     args = p.parse_args(argv)
     try:
         with open_pst(args.file) as pst:
             {"info": _cmd_info, "folders": _cmd_folders, "items": _cmd_items,
-             "props": _cmd_props, "extract": _cmd_extract}[args.cmd](pst, args)
+             "props": _cmd_props, "extract": _cmd_extract, "export": _cmd_export}[args.cmd](pst, args)
     except PSTError as exc:
         print("pstprobe: %s" % exc, file=sys.stderr)
         return 1
