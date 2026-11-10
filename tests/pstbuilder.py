@@ -174,11 +174,11 @@ class Builder:
             inflated = len(data)
             if bid in self.inflate:
                 # a reader tells a compressed block by its size differing from the inflated
-                # size, so keep the compressed form only when it is smaller. zlib builds differ
-                # (Python 3.14 on Windows ships zlib-ng), and a block that compresses to its own
-                # length would read as uncompressed.
+                # size, so a block that compresses to its own length is stored as it is. zlib
+                # builds differ (Python 3.14 on Windows ships zlib-ng), so which blocks those
+                # are depends on the platform.
                 packed = zlib.compress(data)
-                if len(packed) < len(data):
+                if len(packed) != len(data):
                     data = packed
             cb = len(data)
             alloc = L.block_alloc(cb)
