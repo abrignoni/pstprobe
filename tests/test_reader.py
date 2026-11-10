@@ -1,9 +1,11 @@
 import contextlib
 import datetime
 import io
+import json
 import struct
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -101,6 +103,92 @@ class StructureTests(unittest.TestCase):
                     pc = P.PropertyContext(node)
                     got = {pid: pc.get(pid) for pid in pc.props}
                     self.assertEqual(got, expected)
+
+
+class SearchFolderTests(unittest.TestCase):
+    def test_search_results_from_tc_and_ac_tables(self):
+        for kind in ("unicode", "ansi", "unicode4k"):
+            crypt = P.CRYPT_NONE if kind == "unicode4k" else P.CRYPT_PERMUTE
+            with self.subTest(kind=kind):
+                raw, facts = pstbuilder.build_sample(kind, crypt, search_tables=True)
+                with P.open_pst(io.BytesIO(raw)) as pst:
+                    for name in ("search_tc", "search_ac"):
+                        folder = pst.folder(facts[name])
+                        self.assertTrue(folder.is_search_folder)
+                        self.assertEqual(folder.search_result_nids(), [facts["msg"]], name)
+                        self.assertEqual(folder.message_nids(), [], name)
+                    # The 0xAC table is not a table context: asking for one says so.
+                    with self.assertRaises(P.UnsupportedError):
+                        pst.folder(facts["search_ac"]).search_contents_table()
+
+    def test_ac_row_ids_follow_row_numbers(self):
+        # The BTH is sorted by row ID; the rows come back in row-number order.
+        class OneBlockNode:
+            nid = 0x730
+
+            def __init__(self, data):
+                self.blocks = [data]
+
+            def block(self, i):
+                return self.blocks[i]
+
+        ids = [0x200064, 0x200024, 0x200044]
+        node = OneBlockNode(pstbuilder.ac_table(ids))
+        self.assertEqual(P.search_table_row_ids(node), ids)
+        self.assertEqual(P.search_table_row_ids(OneBlockNode(pstbuilder.ac_table([]))), [])
+        with self.assertRaises(P.CorruptError):
+            P.search_table_row_ids(OneBlockNode(pstbuilder.Builder().tc([0x67F20003], [])))
+
+
+class VerifyTests(unittest.TestCase):
+    VARIANTS = (("unicode", P.CRYPT_PERMUTE, False), ("ansi", P.CRYPT_CYCLIC, False),
+                ("unicode4k", P.CRYPT_NONE, True))
+
+    def test_built_files_match(self):
+        for kind, crypt, compress in self.VARIANTS:
+            with self.subTest(kind=kind):
+                raw, _ = pstbuilder.build_sample(kind, crypt, compress=compress)
+                with P.open_pst(io.BytesIO(raw)) as pst:
+                    r = pst.verify()
+                self.assertTrue(r["all_match"], r)
+                self.assertGreater(r["pages"]["match"], 0)
+                self.assertGreater(r["blocks"]["match"], 0)
+                self.assertEqual(set(r["header"]), {"partial"} if kind == "ansi" else {"partial", "full"})
+
+    def test_one_flipped_byte_is_found_where_it_is(self):
+        for kind, crypt, compress in self.VARIANTS:
+            raw, _ = pstbuilder.build_sample(kind, crypt, compress=compress)
+            with P.open_pst(io.BytesIO(raw)) as pst:
+                ent = next(iter(pst.iter_bbt()))
+                page_ib = pst.bbt_root[1]
+            for where, off in (("block", ent.ib + 1), ("page", page_ib + 1), ("header", 20)):
+                with self.subTest(kind=kind, where=where):
+                    bad = bytearray(raw)
+                    bad[off] ^= 0xFF
+                    with P.open_pst(io.BytesIO(bytes(bad))) as pst:
+                        r = pst.verify()
+                    self.assertFalse(r["all_match"])
+                    self.assertEqual(r["blocks"]["mismatch_bids"], ["0x%x" % ent.bid] if where == "block" else [])
+                    self.assertEqual(r["pages"]["mismatch_offsets"], ["0x%x" % page_ib] if where == "page" else [])
+                    self.assertEqual(r["header"]["partial"], where != "header")
+                    self.assertEqual(r["pages"]["unreadable"] + r["blocks"]["unreadable"], 0)
+
+    def test_cli_exit_status(self):
+        raw, _ = pstbuilder.build_sample()
+        with tempfile.TemporaryDirectory() as d:
+            good = os.path.join(d, "good.pst")
+            bad = os.path.join(d, "bad.pst")
+            with open(good, "wb") as f:
+                f.write(raw)
+            damaged = bytearray(raw)
+            damaged[20] ^= 0xFF
+            with open(bad, "wb") as f:
+                f.write(damaged)
+            for path, status in ((good, 0), (bad, 1)):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(P.main(["verify", path]), status)
+                self.assertEqual(json.loads(out.getvalue())["all_match"], status == 0)
 
 
 class RefusalTests(unittest.TestCase):

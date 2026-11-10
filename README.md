@@ -67,7 +67,19 @@ python3 pstprobe.py body     mailbox.pst 0x200044 --format from-rtf -o body.txt
 python3 pstprobe.py extract  mailbox.pst -o attachments/
 python3 pstprobe.py export   mailbox.pst --folder 0x8082 -o out/      # one folder
 python3 pstprobe.py export   mailbox.pst --recursive -o out/          # every folder
+python3 pstprobe.py verify   mailbox.pst      # the stored CRCs of header, pages and blocks
 ```
+
+`verify` recomputes the CRCs the file stores ([MS-PST] 5.3) and compares them: the header's
+(dwCRCPartial and, in a Unicode file, dwCRCFull), every page of the two B-trees, and every
+block, as stored (before decoding or inflating). It prints JSON counts of matches and
+mismatches, with up to ten page offsets or BIDs of each failure, and exits 1 if anything
+does not match or could not be read. A page or block that cannot be read is counted as
+"unreadable", apart from mismatches. Allocation map pages and the density list are not
+read by pstprobe and are not checked. `verify` reads every block, so it takes as long as
+reading the whole file. The other commands do not check these CRCs and read a file whose
+CRCs do not match. (The CRC inside a compressed RTF body is a different check, made
+whenever the body is read.)
 
 `body` writes one item's body: `text` (PidTagBody, as UTF-8), `html` (PidTagBodyHtml as
 stored), `rtf` (PidTagRtfCompressed, decompressed) or `from-rtf` (the plain text or HTML that
@@ -139,7 +151,13 @@ testing. The binaries bundle Python 3.13 with Tk 8.6.
 - Named properties (IDs from 0x8000) are resolved through the store's name-to-ID map:
   `message.get_named(guid, lid_or_name)`.
 - A search folder's results name items that live in other folders. They are not
-  returned by `messages()`; `search_result_nids()` lists them.
+  returned by `messages()`; `search_result_nids()` lists them. Some files keep a search
+  folder's results in a table whose heap has client signature 0xAC, which [MS-PST] 2.3.1.2
+  lists as reserved. For that table only the row index is read (the item NIDs, from the
+  layout in the PFF notes below); its rows' values are not, and `search_contents_table()`
+  raises `UnsupportedError` for it. In the three files seen with one, every row was an item
+  that a normal folder also lists, and the count equalled the folder's
+  PidTagContentCount.
 - `info` reports PidTagPstPassword, the CRC-32 of a PST password ([MS-PST] 2.4.3.3), as
   `password_crc32`, and `password_set` is true when it is nonzero. The password does not
   protect the data, so the file is read either way: the specification says readers must
@@ -161,7 +179,7 @@ testing. The binaries bundle Python 3.13 with Tk 8.6.
   difference from the items the folders list is visible. In the Outlook PST above, a
   mail deleted from Deleted Items was not among the file's message nodes; whether any
   of it remains elsewhere in the file was not examined.
-- Page and block CRCs are not checked.
+- CRCs are checked only by `verify`, not while reading.
 - Personal address books (`.pab`) are accepted by signature and have not been tested.
 
 ## Binaries
@@ -281,6 +299,15 @@ distinct: the Outlook PSTs, the CFReDS OST and the public test files) it ran 5,2
 with no failure on each of macOS 27 (Python 3.12, Tk 8.6), Windows 11 on ARM (Python 3.11,
 Tk 8.6) and Ubuntu 26.04 (Python 3.14, Tk 8.6).
 
+`verify` was run on every file above. All stored CRCs matched: in the Enron set, the
+headers of all 171 files, 1,049,369 B-tree pages and 14,152,495 blocks (331 s in all, at
+most 10.4 s for one file); in the 23 distinct other files (the Outlook PSTs, the CFReDS
+OST and the public test files), 1,412 pages and 14,750 blocks. To show it can fail, one
+byte was flipped in a copy of a public test file, once in a block, once in a B-tree page
+and once in the header: each time `verify` named that block, that page or the header,
+and exited 1. Those files hold no mismatch, so how `verify` reports one in a real damaged
+file has been seen only on those planted copies.
+
 The tests (`python3 -m unittest discover -s tests`) need no data and no packages.
 
 ## Sources
@@ -294,7 +321,9 @@ The tests (`python3 -m unittest discover -s tests`) need no data and no packages
   structure only; no text is copied. Two points were measured on a real OST instead:
   a block's 24-byte trailer sits at the end of its 512-byte-aligned allocation, and a
   compressed block is a zlib stream (header 0x78 0x9C), not raw deflate. A block can
-  inflate past 8,192 bytes (26,644 bytes seen).
+  inflate past 8,192 bytes (26,644 bytes seen). The same notes give the layout of the
+  0xAC table's header and row index, and the place of a 4 KB page's CRC; both were
+  checked on real files (above, and every 4 KB page CRC in the OSTs read matched).
 - Microsoft, [MS-OXCDATA] v20250520, 2.11.1, for string termination, and [MS-OXPROPS]
   for property IDs.
 - Microsoft, [MS-OXRTFCP] v20250520, for compressed RTF: the header, the 207-byte

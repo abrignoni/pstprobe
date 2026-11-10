@@ -206,6 +206,9 @@ HN_SIG = 0xEC
 CLIENT_SIG_TC = 0x7C
 CLIENT_SIG_BTH = 0xB5
 CLIENT_SIG_PC = 0xBC
+# [MS-PST] 2.3.1.2 lists 0xAC as reserved. Outlook writes it for some search contents
+# tables; only its row index is read (see search_table_row_ids).
+CLIENT_SIG_AC = 0xAC
 
 # Property types, [MS-PST] 2.1.1
 PT_INT16 = 0x0002
@@ -817,6 +820,94 @@ class PSTFile:
             **self.password(),
         }
 
+    def verify(self, examples=10):
+        """Check the CRCs the file stores: the header's, every B-tree page's and every block's.
+
+        [MS-PST] 5.3 gives the algorithm (seed 0, no final inversion). The header's
+        dwCRCPartial covers the 471 bytes from offset 8 and, in a Unicode file, dwCRCFull the
+        516 bytes from offset 8 (2.2.2.6). A page's dwCRC covers the page before its trailer
+        (2.2.2.7.1) and a block's covers its cb stored bytes, before decoding (2.2.2.8.1). For
+        a 4 KB-page OST the page trailer is at byte 4072 and the CRC sits where it does in a
+        Unicode trailer, from the PFF format notes; checked on real OSTs.
+
+        Only the pages of the two B-trees are checked: allocation map pages and the density
+        list are not read by pstprobe and are not checked. Nothing is refused: a mismatch is
+        counted and reading goes on. A page or block that cannot be read at all is counted
+        under "unreadable", apart from mismatches. Returns a dict of counts, with up to
+        `examples` offsets or BIDs of each kind of failure.
+        """
+        L = self.layout
+        out = {"header": {}, "pages": {"checked": 0, "match": 0, "mismatch": 0, "unreadable": 0,
+                                       "mismatch_offsets": [], "unreadable_offsets": []},
+               "blocks": {"checked": 0, "match": 0, "mismatch": 0, "unreadable": 0,
+                          "mismatch_bids": [], "unreadable_bids": []}}
+        h = self._read(0, 564)
+        stored = struct.unpack_from("<I", h, 4)[0]
+        out["header"]["partial"] = ndb_crc(h[8:8 + 471]) == stored
+        if self.kind != "ansi":
+            stored = struct.unpack_from("<I", h, 524)[0]
+            out["header"]["full"] = ndb_crc(h[8:8 + 516]) == stored
+
+        def note(group, key, value):
+            if len(group[key]) < examples:
+                group[key].append(value)
+
+        pages = out["pages"]
+        crc_at = L.page_trailer + (8 if self.kind == "ansi" else 4)
+        for root_ib, ptype in ((self.nbt_root[1], PTYPE_NBT), (self.bbt_root[1], PTYPE_BBT)):
+            stack, seen = [(root_ib, 0)], set()
+            while stack:
+                ib, depth = stack.pop()
+                if ib in seen or depth > 32:
+                    pages["unreadable"] += 1
+                    note(pages, "unreadable_offsets", "0x%x" % ib)
+                    continue
+                seen.add(ib)
+                try:
+                    level, cb_ent, c_ent, raw = self._page(ib, ptype)
+                except (PSTError,) + DAMAGE_ERRORS:
+                    pages["unreadable"] += 1
+                    note(pages, "unreadable_offsets", "0x%x" % ib)
+                    continue
+                pages["checked"] += 1
+                if ndb_crc(raw[:L.page_trailer]) == struct.unpack_from("<I", raw, crc_at)[0]:
+                    pages["match"] += 1
+                else:
+                    pages["mismatch"] += 1
+                    note(pages, "mismatch_offsets", "0x%x" % ib)
+                if level > 0:
+                    for _, _, child in self._branch_entries(raw, c_ent, cb_ent):
+                        stack.append((child, depth + 1))
+
+        blocks = out["blocks"]
+        crc_off = 8 if self.kind == "ansi" else 4
+        try:
+            entries = list(self.iter_bbt())
+        except (PSTError,) + DAMAGE_ERRORS:
+            entries = []
+            blocks["unreadable_bbt"] = True
+        for ent in entries:
+            alloc = L.block_alloc(ent.cb)
+            try:
+                raw = self._read(ent.ib, alloc)
+                if len(raw) < alloc:
+                    raise CorruptError("short read")
+            except (PSTError,) + DAMAGE_ERRORS:
+                blocks["unreadable"] += 1
+                note(blocks, "unreadable_bids", "0x%x" % ent.bid)
+                continue
+            blocks["checked"] += 1
+            stored = struct.unpack_from("<I", raw, alloc - L.block_trailer + crc_off)[0]
+            if ndb_crc(raw[:ent.cb]) == stored:
+                blocks["match"] += 1
+            else:
+                blocks["mismatch"] += 1
+                note(blocks, "mismatch_bids", "0x%x" % ent.bid)
+        out["all_match"] = (all(out["header"].values()) and not blocks.get("unreadable_bbt")
+                            and not (pages["mismatch"] or pages["unreadable"]
+                                     or blocks["mismatch"] or blocks["unreadable"]))
+        return out
+
     def password(self):
         """PidTagPstPassword of the message store, [MS-PST] 2.4.3.3.
 
@@ -1096,12 +1187,45 @@ class PropertyContext:
             yield pid, ptype, val
 
 
+def search_table_row_ids(node):
+    """Row IDs of a table whose heap has client signature 0xAC, in row-number order.
+
+    [MS-PST] does not describe this table (2.3.1.2 lists 0xAC as reserved). The layout used
+    is from Joachim Metz's PFF format notes: a 40-byte header whose first byte is 0xAC and
+    whose bytes 10 to 13 are the HID of a BTH with 4-byte keys (the row ID) and 4-byte
+    values (the row number), as in a table context's row index. Only that index is read;
+    the rows' values are not. Measured on three files: every row ID was an item node and
+    the count equalled the folder's PidTagContentCount.
+    """
+    heap = Heap(node)
+    if heap.client_sig != CLIENT_SIG_AC:
+        raise CorruptError("node 0x%x: client signature 0x%02x, expected 0xAC"
+                           % (node.nid, heap.client_sig))
+    info = heap.get(heap.user_root)
+    if len(info) < 14 or info[0] != CLIENT_SIG_AC:
+        raise CorruptError("node 0x%x: 0xAC table header is %d bytes, type 0x%02x"
+                           % (node.nid, len(info), info[0] if info else 0))
+    hid = struct.unpack_from("<I", info, 10)[0]
+    rows = []
+    if hid:
+        for k, v in bth_items(heap, hid):
+            if len(k) != 4:
+                raise CorruptError("node 0x%x: 0xAC row index key is %d bytes" % (node.nid, len(k)))
+            rows.append((int.from_bytes(v, "little"), struct.unpack_from("<I", k)[0]))
+    rows.sort()
+    return [rid for _, rid in rows]
+
+
 class TableContext:
     """A table context ([MS-PST] 2.3.4)."""
 
     def __init__(self, node):
         self.node = node
         self.heap = Heap(node)
+        if self.heap.client_sig == CLIENT_SIG_AC:
+            raise UnsupportedError("node 0x%x: table with client signature 0xAC, which [MS-PST] "
+                                   "lists as reserved; only its row IDs are read "
+                                   "(search_table_row_ids)" % node.nid)
         if self.heap.client_sig != CLIENT_SIG_TC:
             raise CorruptError("node 0x%x: client signature 0x%02x is not a table context"
                                % (node.nid, self.heap.client_sig))
@@ -1264,8 +1388,14 @@ class Folder:
         return [rid for rid, _ in t.row_index] if t else []
 
     def search_result_nids(self):
-        t = self.search_contents_table() if self.is_search_folder else None
-        return [rid for rid, _ in t.row_index] if t else []
+        if not self.is_search_folder:
+            return []
+        node = self.pst.node((self.nid & ~0x1F) | NID_TYPE_SEARCH_CONTENTS_TABLE)
+        if node is None:
+            return []
+        if Heap(node).client_sig == CLIENT_SIG_AC:
+            return search_table_row_ids(node)
+        return [rid for rid, _ in TableContext(node).row_index]
 
     def assoc_message_nids(self):
         t = self.assoc_contents_table()
@@ -1291,6 +1421,12 @@ _RTF_PRELOAD = (b"{\\rtf1\\ansi\\mac\\deff0\\deftab720{\\fonttbl;}{\\f0\\fnil \\
                 b"\\fmodern \\fscript \\fdecor MS Sans SerifSymbolArialTimes New RomanCourier"
                 b"{\\colortbl\\red0\\green0\\blue0\r\n\\par \\pard\\plain\\f0\\fs20\\b\\i\\u\\tab\\tx")
 assert len(_RTF_PRELOAD) == 207
+
+
+def ndb_crc(data):
+    """[MS-PST] 5.3 CRC with the seed of 0 the specification requires. The table is
+    zlib's CRC-32 table; the algorithm has no initial or final inversion."""
+    return rtf_crc(data, 0)
 
 
 def rtf_crc(data, value=0):
@@ -2301,6 +2437,12 @@ def _cmd_export(pst, args):
           + " written to %s" % args.output)
 
 
+def _cmd_verify(pst, args):
+    result = pst.verify()
+    print(json.dumps(result, indent=2))
+    return 0 if result["all_match"] else 1
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="pstprobe", description="Read Outlook PST and OST files.")
     p.add_argument("--version", action="version", version="pstprobe " + __version__)
@@ -2311,7 +2453,8 @@ def main(argv=None):
                            ("props", "every property of one node"),
                            ("body", "one item's body: plain text, HTML, RTF, or what RTF encapsulates"),
                            ("extract", "write every file attachment to a folder"),
-                           ("export", "write a folder's items (JSON lines) and attachments")):
+                           ("export", "write a folder's items (JSON lines) and attachments"),
+                           ("verify", "check the stored CRCs of the header, B-tree pages and blocks")):
         s = sub.add_parser(name, help=helptext)
         s.add_argument("file")
         if name == "items":
@@ -2334,8 +2477,9 @@ def main(argv=None):
     args = p.parse_args(argv)
     try:
         with open_pst(args.file) as pst:
-            {"info": _cmd_info, "folders": _cmd_folders, "items": _cmd_items,
-             "props": _cmd_props, "body": _cmd_body, "extract": _cmd_extract, "export": _cmd_export}[args.cmd](pst, args)
+            status = {"info": _cmd_info, "folders": _cmd_folders, "items": _cmd_items,
+                      "props": _cmd_props, "body": _cmd_body, "extract": _cmd_extract,
+                      "export": _cmd_export, "verify": _cmd_verify}[args.cmd](pst, args)
     except PSTError as exc:
         print("pstprobe: %s" % exc, file=sys.stderr)
         return 1
@@ -2346,7 +2490,7 @@ def main(argv=None):
     except FileExistsError as exc:
         print("pstprobe: will not replace %s" % exc.filename, file=sys.stderr)
         return 1
-    return 0
+    return status or 0
 
 
 if __name__ == "__main__":

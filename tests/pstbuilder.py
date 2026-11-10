@@ -179,12 +179,13 @@ class Builder:
             ib = len(out)
             blk = bytearray(alloc)
             blk[:cb] = data
+            crc = P.ndb_crc(data)       # [MS-PST] 2.2.2.8.1: the cb stored bytes
             if L.kind == "ansi":
-                tr = struct.pack("<HHII", cb, 0, bid, 0)
+                tr = struct.pack("<HHII", cb, 0, bid, crc)
             elif L.kind == "unicode":
-                tr = struct.pack("<HHIQ", cb, 0, 0, bid)
+                tr = struct.pack("<HHIQ", cb, 0, crc, bid)
             else:
-                tr = struct.pack("<HHIQHHI", cb, 0, 0, bid, 2, inflated, 0)
+                tr = struct.pack("<HHIQHHI", cb, 0, crc, bid, 2, inflated, 0)
             blk[alloc - len(tr):] = tr
             out += blk
             placed[bid] = (ib, cb)
@@ -238,10 +239,11 @@ class Builder:
         else:
             struct.pack_into("<BBBB", page, L.bt_meta, len(entries), L.bt_meta // cb_ent, cb_ent, level)
         t = L.page_trailer
+        crc = P.ndb_crc(page[:t])       # [MS-PST] 2.2.2.7.1: the page before its trailer
         if L.kind == "ansi":
-            struct.pack_into("<BBHII", page, t, ptype, ptype, 0, bid, 0)
+            struct.pack_into("<BBHII", page, t, ptype, ptype, 0, bid, crc)
         else:
-            struct.pack_into("<BBHIQ", page, t, ptype, ptype, 0, 0, bid)
+            struct.pack_into("<BBHIQ", page, t, ptype, ptype, 0, crc, bid)
         return page
 
     def _header(self, out, nbt_ib, bbt_ib):
@@ -259,6 +261,8 @@ class Builder:
             struct.pack_into("<QQQQQQQQ", h, 184, len(out), 0, 0, 0, 0x1004 | 2, nbt_ib, 0x1000 | 2, bbt_ib)
             h[512] = 0x80
             h[513] = self.crypt
+            struct.pack_into("<I", h, 524, P.ndb_crc(h[8:8 + 516]))
+        struct.pack_into("<I", h, 4, P.ndb_crc(h[8:8 + 471]))   # [MS-PST] 2.2.2.6
         out[0:564] = h
 
 
@@ -275,8 +279,21 @@ def i32(v):
     return struct.pack("<i", v)
 
 
+def ac_table(row_ids):
+    """A table with client signature 0xAC, written from the layout search_table_row_ids reads
+    (a 40-byte header whose bytes 10 to 13 hold the HID of a row index BTH). Columns and row
+    values are left empty: the reader does not read them."""
+    h = Heap(P.CLIENT_SIG_AC)
+    index = bth(h, 4, 4, [(i32(rid), i32(n)) for n, rid in enumerate(row_ids)])
+    header = bytearray(40)
+    header[0] = P.CLIENT_SIG_AC
+    struct.pack_into("<I", header, 10, index)
+    h.user_root = h.alloc(header)
+    return h.build()
+
+
 def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False, password=None, rtf=None,
-                 att_props=()):
+                 att_props=(), search_tables=False):
     """A store with a root folder, one child folder 'Inbox' holding one message that has
     two recipients, one file attachment of 20,000 bytes (a data tree) and one named
     property. Returns (bytes, facts)."""
@@ -338,9 +355,20 @@ def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False, password
     if rtf is not None:
         props.append((P.PID_TAG_RTF_COMPRESSED, P.PT_BINARY, rtf))
     b.node(msg, b.pc(props), sub=sub, parent=inbox)
+    facts = {"inbox": inbox, "msg": msg, "att_payload": att_payload, "guid_appt": guid_appt}
+    if search_tables:
+        # Two search folders, not linked from the hierarchy: one whose search contents
+        # table is a table context, one whose table has client signature 0xAC.
+        for name, index, table in (
+                ("search_tc", 0x481, b.tc([0x67F20003], [{0x67F20003: i32(msg)}])),
+                ("search_ac", 0x482, ac_table([msg]))):
+            nid = P.make_nid(P.NID_TYPE_SEARCH_FOLDER, index)
+            b.node(nid, b.pc([(P.PID_TAG_DISPLAY_NAME, P.PT_UNICODE, u16(name)),
+                              (P.PID_TAG_CONTENT_COUNT, P.PT_INT32, i32(1))]), parent=root)
+            b.node((nid & ~0x1F) | P.NID_TYPE_SEARCH_CONTENTS_TABLE, table)
+            facts[name] = nid
     if compress:
         b.inflate.update(bid for bid in b.blocks if not bid & 2)
-    facts = {"inbox": inbox, "msg": msg, "att_payload": att_payload, "guid_appt": guid_appt}
     return b.build(), facts
 
 
