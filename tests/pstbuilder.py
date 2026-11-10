@@ -275,7 +275,8 @@ def i32(v):
     return struct.pack("<i", v)
 
 
-def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False, password=None, rtf=None):
+def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False, password=None, rtf=None,
+                 att_props=()):
     """A store with a root folder, one child folder 'Inbox' holding one message that has
     two recipients, one file attachment of 20,000 bytes (a data tree) and one named
     property. Returns (bytes, facts)."""
@@ -319,7 +320,7 @@ def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False, password
     att_pc = b.pc([(P.PID_TAG_ATTACH_METHOD, P.PT_INT32, i32(1)),
                    (P.PID_TAG_ATTACH_LONG_FILENAME, P.PT_UNICODE, u16("kd.bin")),
                    (P.PID_TAG_ATTACH_SIZE, P.PT_INT32, i32(20100)),
-                   (P.PID_TAG_ATTACH_DATA_BINARY, P.PT_BINARY, att_data_nid)])
+                   (P.PID_TAG_ATTACH_DATA_BINARY, P.PT_BINARY, att_data_nid)] + list(att_props))
     att_sub = b.subnodes([(att_data_nid, att_data_bid, 0)])
     recip = b.tc([0x67F20003, 0x3001001F, 0x0C150003],
                  [{0x67F20003: i32(0), 0x3001001F: u16("kd one"), 0x0C150003: i32(1)},

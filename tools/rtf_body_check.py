@@ -7,6 +7,11 @@ that also stores PidTagBody, a second record of the same content:
 
 - plain text: the de-encapsulated text must equal PidTagBody, with CRLF compared as LF and
   trailing line breaks, spaces and NULs set aside;
+- RTF that encapsulates nothing (a document written as RTF): the text render_rtf_text gives
+  must have the same non-whitespace characters as PidTagBody, as for HTML below. Outlook's
+  plain text adds ">" before quoted lines and "*" before list items, which the RTF holds as
+  formatting, not text; an item that differs only by those inserted marks is counted under
+  "equal_but_marks", not as a difference;
 - HTML: the visible text of the de-encapsulated HTML (html.parser, without head, style,
   script and title, entities decoded) must have the same non-whitespace characters as
   PidTagBody, after removing from both the bracketed link targets (<http://...>,
@@ -15,6 +20,7 @@ that also stores PidTagBody, a second record of the same content:
 Prints one JSON line per file with counts, and the NIDs of items that differ. No content.
 Exit status 1 if any item differs.
 """
+import difflib
 import html.parser
 import json
 import os
@@ -60,6 +66,16 @@ def _chars(text):
     return "".join(LINK.sub("", text).replace(" ", " ").split())
 
 
+def _only_marks_added(ours, theirs):
+    """True when theirs is ours with only ">" and "*" characters inserted."""
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ours, theirs, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        if op != "insert" or set(theirs[j1:j2]) - {">", "*"}:
+            return False
+    return True
+
+
 def _lines(text):
     return text.replace("\r\n", "\n").rstrip("\n\0 ")
 
@@ -67,7 +83,7 @@ def _lines(text):
 def check_file(path, name=None):
     """path may be a binary file object, with name for the report."""
     r = {"file": name or os.path.basename(path), "rtf": 0, "encapsulates": Counter(), "compared": Counter(),
-         "equal": Counter(), "no_plain_body": 0, "differ": []}
+         "equal": Counter(), "equal_but_marks": 0, "no_plain_body": 0, "differ": []}
     with pstprobe.open_pst(path) as pst:
         for folder in pst.walk_folders():
             for nid in folder.message_nids():
@@ -78,7 +94,8 @@ def check_file(path, name=None):
                 kind, text = m.rtf_original()
                 r["encapsulates"][kind or "nothing"] += 1
                 if kind is None:
-                    continue
+                    kind = "rtf"
+                    text = pstprobe.render_rtf_text(m.rtf_body())[0]
                 body = m.body()
                 if body is None:
                     r["no_plain_body"] += 1
@@ -86,6 +103,11 @@ def check_file(path, name=None):
                 r["compared"][kind] += 1
                 if kind == "text":
                     same = _lines(text) == _lines(body)
+                elif kind == "rtf":
+                    same = _chars(text) == _chars(body)
+                    if not same and _only_marks_added(_chars(text), _chars(body)):
+                        r["equal_but_marks"] += 1
+                        continue
                 else:
                     same = _chars(visible_text(text)) == _chars(body)
                 if same:

@@ -246,6 +246,8 @@ PID_TAG_PST_PASSWORD = 0x67FF
 PID_TAG_BODY = 0x1000
 PID_TAG_RTF_COMPRESSED = 0x1009
 PID_TAG_BODY_HTML = 0x1013
+PID_TAG_RENDERING_POSITION = 0x370B
+PID_TAG_ATTACHMENT_HIDDEN = 0x7FFE
 PID_TAG_CONTENT_COUNT = 0x3602
 PID_TAG_CONTENT_UNREAD_COUNT = 0x3603
 PID_TAG_SUBFOLDERS = 0x360A
@@ -1496,6 +1498,29 @@ def deencapsulate_rtf(rtf):
     kind = rtf_encapsulation(rtf)
     if kind is None:
         return None, None
+    return kind, _render_rtf(rtf, kind)[0]
+
+
+def render_rtf_text(rtf):
+    """The text of an RTF body that does not encapsulate HTML, and the character offsets in
+    that text of each \\objattph ([MS-OXRTFEX] 2.2.3.4), as (text, offsets).
+
+    For RTF that encapsulates plain text this is the same text as deencapsulate_rtf gives.
+    For other RTF (a document written as RTF) the same rules give its visible text: text runs,
+    \\par and \\line as CRLF, \\tab, the character control words and \\uN, with
+    destinations skipped. Formatting (tables, lists, fonts) is not rendered. Offsets count
+    Python characters (code points). Returns (None, []) for RTF that encapsulates HTML.
+    """
+    kind = rtf_encapsulation(rtf)
+    if kind == "html":
+        return None, []
+    return _render_rtf(rtf, kind or "rtf")
+
+
+def _render_rtf(rtf, kind):
+    """kind: "html" or "text" (encapsulated) or "rtf" (not encapsulated, read as text).
+    Returns (text, \\objattph offsets)."""
+    positions = []
     fonts = {}          # font number -> code page
     default_cp = 1252
     out = []
@@ -1573,6 +1598,8 @@ def deencapsulate_rtf(rtf):
             if not stack:
                 break
             state = stack.pop()
+            if not stack:
+                break  # the root group is closed: the document ends here
             skip_chars = 0
             continue
         first, state[FIRST] = state[FIRST], False
@@ -1653,8 +1680,11 @@ def deencapsulate_rtf(rtf):
                 skip_chars = state[UC]
             elif name in _RTF_CHAR_WORDS and not (state[HTMLTAG] and name == "line"):
                 emit(_RTF_CHAR_WORDS[name])
+            elif name == "objattph" and not state[HTMLTAG]:
+                emit("")
+                positions.append(sum(len(piece) for piece in out))
     emit("")  # an unpaired high surrogate at the end
-    return kind, "".join(out)
+    return "".join(out), positions
 
 
 class Message:
@@ -1710,6 +1740,54 @@ class Message:
         if rtf is None:
             return None, None
         return deencapsulate_rtf(rtf)
+
+    def rtf_text(self):
+        """What `body --format from-rtf` gives, as (kind, str): the encapsulated text ("text")
+        or HTML ("html"), else the text of an RTF document ("rendered", render_rtf_text);
+        (None, None) without an RTF body. Raises CorruptError if the RTF is damaged."""
+        kind, text = self.rtf_original()
+        if kind is not None:
+            return kind, text
+        rtf = self.rtf_body()
+        if rtf is None:
+            return None, None
+        return "rendered", render_rtf_text(rtf)[0]
+
+    def rtf_attachment_placement(self):
+        """Where the attachments belong in the RTF body's text, [MS-OXRTFEX] 2.2.3.4.
+
+        Returns (text, placements). text is render_rtf_text's text (None for RTF that
+        encapsulates HTML, or no RTF body, and then placements is empty). placements has one
+        (attachment, offset, placed_by) per attachment that is not hidden
+        (PidTagAttachmentHidden) and whose PidTagRenderingPosition is not 0xFFFFFFFF, in
+        PidTagRenderingPosition order (2.2.2). When the number of \\objattph in the RTF equals
+        the number of those attachments, the n-th goes at the n-th \\objattph's offset
+        (placed_by "objattph"; an offset past the end becomes the end); otherwise every one
+        goes at the end of the text (placed_by "end"), as the specification says to.
+        """
+        rtf = self.rtf_body()
+        if rtf is None:
+            return None, []
+        text, positions = render_rtf_text(rtf)
+        if text is None:
+            return None, []
+        shown = []
+        for a in self.attachments():
+            hidden = a.get(PID_TAG_ATTACHMENT_HIDDEN)
+            where = a.get(PID_TAG_RENDERING_POSITION)
+            if hidden or (isinstance(where, int) and where & 0xFFFFFFFF == 0xFFFFFFFF):
+                continue
+            shown.append((where & 0xFFFFFFFF if isinstance(where, int) else 0xFFFFFFFF, a))
+        shown.sort(key=lambda pair: pair[0])
+        if len(positions) != len(shown):
+            positions = []
+        placements = []
+        for n, (_where, a) in enumerate(shown):
+            if n < len(positions):
+                placements.append((a, min(positions[n], len(text)), "objattph"))
+            else:
+                placements.append((a, len(text), "end"))
+        return text, placements
 
     def recipient_table(self):
         sub = self.node.subnode(NID_RECIPIENT_TABLE)
@@ -1953,12 +2031,17 @@ def item_record(message, attachments_dir=None, rel_dir="attachments", depth=0, c
                 with open(os.path.join(bodies_dir, name), "xb") as out:
                     out.write(rtf)
                 rec["rtf_file"] = bodies_rel + "/" + name
-                kind, text = deencapsulate_rtf(rtf)
-                if kind is not None:
-                    name = "%s.from-rtf.%s" % (chain, "html" if kind == "html" else "txt")
-                    with open(os.path.join(bodies_dir, name), "xb") as out:
-                        out.write(rtf_original_bytes(kind, text))
-                    rec["rtf_original_file"] = bodies_rel + "/" + name
+                kind, text = message.rtf_text()
+                name = "%s.from-rtf.%s" % (chain, "html" if kind == "html" else "txt")
+                with open(os.path.join(bodies_dir, name), "xb") as out:
+                    out.write(rtf_original_bytes(kind, text))
+                rec["rtf_original_file"] = bodies_rel + "/" + name
+                rec["rtf_original_kind"] = kind
+                if kind != "html":
+                    rec["rtf_attachment_positions"] = [
+                        OrderedDict((("attachment_nid", a.nid), ("offset", offset),
+                                     ("placed_by", how)))
+                        for a, offset, how in message.rtf_attachment_placement()[1]]
         except DAMAGE_ERRORS as exc:
             rec["rtf_error"] = str(exc)
     try:
@@ -2178,7 +2261,7 @@ def _cmd_body(pst, args):
     if args.format == "rtf":
         data = m.rtf_body()
     elif args.format == "from-rtf":
-        kind, text = m.rtf_original()
+        kind, text = m.rtf_text()
         data = rtf_original_bytes(kind, text) if kind is not None else None
     elif args.format == "html":
         data = m.html_body()
@@ -2189,8 +2272,7 @@ def _cmd_body(pst, args):
         if isinstance(data, str):
             data = data.encode("utf-8")
     if data is None:
-        raise PSTError("message 0x%x has no %s body" % (
-            nid, "RTF body that encapsulates text or HTML" if args.format == "from-rtf" else args.format))
+        raise PSTError("message 0x%x has no %s body" % (nid, "RTF" if args.format == "from-rtf" else args.format))
     if args.output:
         with open(args.output, "xb") as out:
             out.write(data)
@@ -2241,8 +2323,8 @@ def main(argv=None):
             s.add_argument("--format", choices=("text", "html", "rtf", "from-rtf"), default="text",
                            help="text is PidTagBody (UTF-8 out), html PidTagBodyHtml, rtf "
                                 "PidTagRtfCompressed decompressed, from-rtf the text (UTF-8) or "
-                                "HTML (ASCII with character references) it encapsulates "
-                                "(default: text)")
+                                "HTML (ASCII with character references) it encapsulates, else "
+                                "the text of the RTF document (default: text)")
             s.add_argument("-o", "--output", help="write to this file (refuses to replace one)")
         if name in ("extract", "export"):
             s.add_argument("-o", "--output", required=True)

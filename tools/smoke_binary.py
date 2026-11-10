@@ -106,7 +106,8 @@ def main():
                 report = json.loads(out)
                 check(report.get("window") == "built" and report.get("items_shown") == 1
                       and report.get("attachment_files_saved") == 1
-                      and report.get("bodies_shown") == ["rtf"] and report.get("body_bytes_saved") == 43,
+                      and report.get("bodies_shown") == ["from-rtf", "rtf"]
+                      and report.get("body_bytes_saved") == 11,
                       "window loaded the file: %s" % report)
             else:
                 print("note  the window printed nothing (a windowed Windows build has no stdout)")

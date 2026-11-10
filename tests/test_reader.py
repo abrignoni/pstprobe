@@ -389,6 +389,48 @@ class RtfDeencapsulationTests(unittest.TestCase):
         self.assertEqual(P.deencapsulate_rtf(rtf), ("html", "<p>bd</p>"))
 
 
+def mela(rtf):
+    """An uncompressed PidTagRtfCompressed value ([MS-OXRTFCP] 2.1.3.1.1, COMPTYPE MELA)."""
+    return struct.pack("<IIII", len(rtf) + 12, len(rtf), 0x414C454D, 0) + rtf
+
+
+class RtfAttachmentPlacementTests(unittest.TestCase):
+    def placement(self, rtf, att_props=()):
+        raw, facts = pstbuilder.build_sample("unicode", P.CRYPT_PERMUTE, rtf=mela(rtf),
+                                             att_props=att_props)
+        with P.open_pst(io.BytesIO(raw)) as pst:
+            text, placed = pst.message(facts["msg"]).rtf_attachment_placement()
+            return text, [(a.filename, offset, how) for a, offset, how in placed]
+
+    def test_objattph_places_the_attachment(self):
+        text, placed = self.placement(b"{\\rtf1\\ansi see:\\objattph\\'20 end}")
+        self.assertEqual(text, "see:  end")
+        self.assertEqual(placed, [("kd.bin", 4, "objattph")])
+
+    def test_count_mismatch_puts_attachments_at_the_end(self):
+        # [MS-OXRTFEX] 2.2.3.4: two \\objattph, one attachment: the positions are ignored
+        text, placed = self.placement(b"{\\rtf1\\ansi a\\objattph b\\objattph c}")
+        self.assertEqual(placed, [("kd.bin", len(text), "end")])
+        text, placed = self.placement(b"{\\rtf1\\ansi no position}")
+        self.assertEqual(placed, [("kd.bin", len(text), "end")])
+
+    def test_objattph_in_a_skipped_destination_is_not_counted(self):
+        text, placed = self.placement(b"{\\rtf1\\ansi {\\*\\x \\objattph}a\\objattph b}")
+        self.assertEqual((text, placed), ("ab", [("kd.bin", 1, "objattph")]))  # the space ends the word
+
+    def test_hidden_and_unrendered_attachments_are_left_out(self):
+        rtf = b"{\\rtf1\\ansi a\\objattph b}"
+        hidden = [(P.PID_TAG_ATTACHMENT_HIDDEN, P.PT_BOOLEAN, struct.pack("<I", 1))]
+        self.assertEqual(self.placement(rtf, hidden)[1], [])
+        unrendered = [(P.PID_TAG_RENDERING_POSITION, P.PT_INT32, struct.pack("<I", 0xFFFFFFFF))]
+        self.assertEqual(self.placement(rtf, unrendered)[1], [])
+        shown = [(P.PID_TAG_RENDERING_POSITION, P.PT_INT32, struct.pack("<I", 0))]
+        self.assertEqual(self.placement(rtf, shown)[1], [("kd.bin", 1, "objattph")])
+
+    def test_html_rtf_has_no_placement(self):
+        self.assertEqual(self.placement(b"{\\rtf1\\ansi\\fromhtml1 {\\*\\htmltag <p>}}"), (None, []))
+
+
 class ExportTests(unittest.TestCase):
     def test_export_folder_writes_items_and_attachments(self):
         import json
@@ -519,7 +561,9 @@ class WindowTest(unittest.TestCase):
         self.assertEqual(json.loads(done.stdout), {
             "window": "built", "menus": 4 + (sys.platform == "darwin"), "folders_shown": 2,
             "items_shown": 1, "properties_shown": 4, "recipients_shown": 2, "attachments_shown": 1,
-            "bodies_shown": ["rtf"], "body_chars_shown": 43, "body_bytes_saved": 43,
+            # the sample's RTF is a document, not encapsulated: the window shows its text
+            # ("hello world") first, with the one attachment marked at the end
+            "bodies_shown": ["from-rtf", "rtf"], "body_chars_shown": 57, "body_bytes_saved": 11,
             "attachment_files_saved": 1, "exported_items": 1})
 
 

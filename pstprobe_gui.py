@@ -181,8 +181,21 @@ _BODY_KINDS = (
     ('html', 'HTML (0x1013)', lambda m: m.html_body(), None, '.html'),
     ('rtf', 'RTF (0x1009)', lambda m: m.rtf_body(),
      lambda v: _shown(v.decode('latin-1')), '.rtf'),
-    ('from-rtf', 'Text or HTML in the RTF', None, None, None),
+    ('from-rtf', 'Text of the RTF', None, None, None),
 )
+
+
+def _with_attachment_marks(text, placements):
+    """The text to show, with a mark where each attachment belongs ([MS-OXRTFEX] 2.2.3.4).
+    The marks are the window's; Save Body writes the text without them."""
+    pieces, last = [], 0
+    for att, offset, how in sorted(placements, key=lambda p: p[1]):
+        pieces.append(text[last:offset])
+        name = _text(att.filename) or 'attachment'
+        pieces.append('[pstprobe: attachment 0x%x %s%s]' % (att.nid, name, '' if how == 'objattph' else ', at the end'))
+        last = offset
+    pieces.append(text[last:])
+    return _shown(''.join(pieces))
 
 
 def item_bodies(message):
@@ -193,13 +206,15 @@ def item_bodies(message):
     for kind, _label, read, show, _ext in _BODY_KINDS:
         if kind == 'from-rtf':
             try:
-                inner, text = message.rtf_original()
+                inner, text = message.rtf_text()
+                placements = message.rtf_attachment_placement()[1] if inner != 'html' else []
             except pstprobe.DAMAGE_ERRORS as error:
                 if 'rtf' in out and out['rtf'][1] is not None:
                     out[kind] = ('error: %s' % error, None, None)
                 continue
             if inner is not None:
-                out[kind] = (_shown(text), pstprobe.rtf_original_bytes(inner, text),
+                out[kind] = (_with_attachment_marks(text, placements),
+                             pstprobe.rtf_original_bytes(inner, text),
                              '.html' if inner == 'html' else '.txt')
             continue
         try:

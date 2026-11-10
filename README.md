@@ -71,7 +71,8 @@ python3 pstprobe.py export   mailbox.pst --recursive -o out/          # every fo
 
 `body` writes one item's body: `text` (PidTagBody, as UTF-8), `html` (PidTagBodyHtml as
 stored), `rtf` (PidTagRtfCompressed, decompressed) or `from-rtf` (the plain text or HTML that
-the RTF encapsulates, below). It writes to standard output, or with
+the RTF encapsulates, or else the text of the RTF document, below). It writes to standard
+output, or with
 `-o` to a file that must not exist yet.
 
 `items` gives each item's folder, NID, message class, recipient count and its
@@ -83,9 +84,11 @@ folder of its own named from its display name and NID): `folder.json` with the f
 properties, `items.jsonl` with one line per item (every property with its
 [MS-OXPROPS] name, type and value, the recipients, and the attachments, attached items
 included), each compressed RTF body decompressed under `bodies/` as `<item NID>.rtf` (named
-in the item's line as `rtf_file`) and, when it encapsulates plain text or HTML, that text as
-`<item NID>.from-rtf.txt` or `.from-rtf.html` (`rtf_original_file`), and the file
-attachments under `attachments/`, named
+in the item's line as `rtf_file`) with what `from-rtf` gives beside it as
+`<item NID>.from-rtf.txt` or `.from-rtf.html` (`rtf_original_file`, and `rtf_original_kind`:
+`text`, `html` or `rendered`). For RTF that is not HTML, `rtf_attachment_positions` gives
+where each attachment belongs in that text (below). The file attachments go under
+`attachments/`, named
 `<item NID>_<attachment NID>_<stored name>`. An attachment of an attached item adds the
 attached item's attachment NID to the chain (`<item NID>_<NID>_<NID>_<stored name>`),
 because attachment NIDs are local to the item that holds them. A file that already exists
@@ -108,8 +111,10 @@ python3 pstprobe_gui.py [mailbox.pst]
 each folder's item count. On the right are the selected folder's items, 500 to a page,
 with their delivery and modification times (UTC) first. Below them, tabs show the
 selected item's properties with their names, its recipients, its attachments and its
-body: the plain text, the HTML source, the RTF source (decompressed) or the text or HTML the
-RTF encapsulates, whichever the item has, shown as text and never rendered (HTML decoded by the item's PidTagInternetCodepage
+body: the plain text, the HTML source, the RTF source (decompressed) or the text of the RTF
+(what `from-rtf` gives, with a mark such as `[pstprobe: attachment 0x8025 report.pdf]` where
+each attachment belongs; the marks are the window's own and Save Body writes the text
+without them), whichever the item has, shown as text and never rendered (HTML decoded by the item's PidTagInternetCodepage
 when Python knows it, else as UTF-8, else as cp1252). NUL characters are left out of the shown text
 (Tk drops them); Save Body writes the stored bytes. It saves a body, one attachment, all
 of an item's attachments, or exports a
@@ -146,10 +151,11 @@ testing. The binaries bundle Python 3.13 with Tk 8.6.
 
 ## What it does not do yet
 
-- An RTF body that encapsulates nothing (a document written as RTF) is returned as RTF; it
-  is not converted to text.
-- De-encapsulation does not place attachments at their `\objattph` positions ([MS-OXRTFEX]
-  2.2.3.4); attachments are listed on their own.
+- The text of an RTF document is its characters only. Formatting is not rendered: Outlook's
+  own plain text adds ">" before quoted lines and "*" before list items, and pstprobe's
+  does not. Embedded objects and pictures are skipped.
+- An attachment that the counts of [MS-OXRTFEX] 2.2.3.4 send to the end is not placed by
+  its PidTagRenderingPosition (which the specification allows but does not require).
 - No recovery. Items that are no longer linked from a folder, and data in free space,
   are not looked for. `info` counts every node in the node B-tree by type, so a
   difference from the items the folders list is visible. In the Outlook PST above, a
@@ -245,9 +251,24 @@ body with the item's own PidTagBody, a second record of the same content:
   `\htmlrtf` suppression switched off in a test copy, 9 of the 17 differ, so the comparison
   catches that fault. None of them stores PidTagBodyHtml, so the HTML markup itself is
   checked only by the specification's worked example (3.1), which comes out as its RTF says.
+- RTF documents (RTF that encapsulates nothing), whose text `render_rtf_text` gives by the
+  same rules: of 495 that also store PidTagBody (Enron and the public test files), 439
+  have the same non-whitespace characters, and the other 56 differ only by the ">" and "*"
+  marks Outlook adds for quotes and lists (`rtf_body_check.py` counts these apart).
 - In the public test files, the 488 plain-text-encapsulating bodies are all one short
   template that holds no text after its header and font table, and de-encapsulate to empty
   text.
+
+Attachment placement ([MS-OXRTFEX] 2.2.3.4): `\objattph` appears only in RTF documents in
+the files read so far (117 items: 115 in the Enron set, 2 in the public test files), never
+in RTF that encapsulates text or HTML. In 69 of them the number of `\objattph` equals the
+number of attachments that are not hidden and have a rendering position, and all 81 of
+those attachments are placed; each lands on the placeholder character (`\'20`) that
+follows its `\objattph`. In the other 48 the numbers differ, so their attachments (8, in
+4 items) go at the end, as the specification says. The other 44 have no attachments at
+all; this Enron release says it removed 39,147 attachments, which may be why, but that is
+not established item by item. No second record of where Outlook would place them was found (its
+plain text has no placeholder), so placement is checked against the RTF itself.
 
 `tools/gui_exercise.py` drives the window itself, with Tk's event loop running: it opens
 each file, expands every folder, shows every page, checks the tabs of a sample of items
@@ -256,7 +277,7 @@ files with `export_folder`), refuses a second save to the same name, cancels a t
 refuses a second export into the same folder (leaving the first byte for byte as it was),
 and opens a damaged copy and a file that is not a PST. Cancel is tried while the export is
 held at its first read, so it is reached on every file that has items. On 24 files (23
-distinct: the Outlook PSTs, the CFReDS OST and the public test files) it ran 5,241 checks
+distinct: the Outlook PSTs, the CFReDS OST and the public test files) it ran 5,288 checks
 with no failure on each of macOS 27 (Python 3.12, Tk 8.6), Windows 11 on ARM (Python 3.11,
 Tk 8.6) and Ubuntu 26.04 (Python 3.14, Tk 8.6).
 
