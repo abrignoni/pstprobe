@@ -230,16 +230,21 @@ An RTF body that encapsulates plain text (`\fromtext`) or HTML (`\fromhtml1`) is
 de-encapsulated by `deencapsulate_rtf`, following [MS-OXRTFEX] 2.2.3 over the RTF syntax of
 the RTF 1.9.1 specification: recognition in the first 10 tokens, HTMLTAG content, HTMLRTF
 suppression scoped by group, destinations skipped (the list is the 294 control words the
-RTF specification's index types as destinations), and text decoded by the current font's
-code page. What it was checked against:
+RTF specification's index types as destinations), text decoded by the current font's code
+page, surrogate pairs in `\uN` joined (an unpaired half becomes U+FFFD), and a backslash
+before CR or LF read as `\par`. `tools/rtf_body_check.py` compares each de-encapsulated
+body with the item's own PidTagBody, a second record of the same content:
 
 - Plain text, against a second record: in the Enron set, all 62 RTF bodies that encapsulate
   plain text de-encapsulate to exactly the item's own PidTagBody (CRLF compared as LF, and
   trailing line breaks, spaces and NULs set aside).
-- HTML, against the specification only: its worked example (3.1) comes out as the example's
-  RTF says. No HTML-encapsulating body read so far has a stored PidTagBodyHtml to compare
-  with (16 in the Enron set, 1 in the public test files), so on real data this path is
-  checked for shape, not content.
+- HTML: all 17 HTML-encapsulating bodies read so far (16 in the Enron set, 1 in the public
+  test files) give visible text (by `html.parser`, without head, style and script) with the
+  same non-whitespace characters as PidTagBody, after removing from both the bracketed link
+  targets (`<http://...>`, `<name@host>`) that a plain-text body adds for each link. With
+  `\htmlrtf` suppression switched off in a test copy, 9 of the 17 differ, so the comparison
+  catches that fault. None of them stores PidTagBodyHtml, so the HTML markup itself is
+  checked only by the specification's worked example (3.1), which comes out as its RTF says.
 - In the public test files, the 488 plain-text-encapsulating bodies are all one short
   template that holds no text after its header and font table, and de-encapsulate to empty
   text.

@@ -352,6 +352,23 @@ class RtfDeencapsulationTests(unittest.TestCase):
         self.assertEqual(self.text(b" \\u8364\\'80x"), "€x")          # \'hh counts as one
         self.assertEqual(self.text(b"{\\uc2 \\u8364??}\\u8364?x"), "€€x")  # scoped
 
+    def test_surrogates_and_range(self):
+        # [MSFT-RTF]: a character above U+FFFF is two \uN, its UTF-16 surrogate pair
+        self.assertEqual(self.text(b" \\u-10179?\\u-8704?x"), "\U0001f600x")
+        self.assertEqual(P.rtf_original_bytes("text", self.text(b" \\u-10179?\\u-8704?")),
+                         "\U0001f600".encode("utf-8"))
+        self.assertEqual(P.rtf_original_bytes("html", self.text(b" \\u-10179?\\u-8704?")),
+                         b"&#128512;")
+        for lone in (b" \\u-10179?x", b" \\u-8704?x", b" \\u99999?x"):
+            self.assertEqual(self.text(lone), "�x")      # unpaired, or not 16-bit
+        self.assertEqual(self.text(b" \\u-10179?"), "�")  # unpaired at the end
+        self.assertEqual(self.text(b" \\u-10179?\\u65?"), "�A")
+
+    def test_backslash_newline_is_par(self):
+        # [MSFT-RTF] "Special Characters": CR or LF after a backslash is a \par
+        self.assertEqual(self.text(b" a\\\r\nb"), "a\r\nb")
+        self.assertEqual(self.text(b" a\\\nb"), "a\r\nb")
+
     def test_code_pages(self):
         fonts = b"{\\fonttbl{\\f0\\fcharset0 A;}{\\f1\\fcharset204 B;}{\\f2\\fcharset0\\cpg1253 C;}}"
         self.assertEqual(self.text(fonts + b"\\f1 \\'c0\\f0 \\'c0\\f2 \\'c1"), "АÀΑ")

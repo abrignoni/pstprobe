@@ -1424,7 +1424,9 @@ _CODEPAGE_CODECS = {10000: "mac-roman", 10006: "mac-greek", 10007: "mac-cyrillic
 _RTF_CHAR_WORDS = {"lquote": "\u2018", "rquote": "\u2019", "ldblquote": "\u201c",
                    "rdblquote": "\u201d", "bullet": "\u2022", "endash": "\u2013",
                    "emdash": "\u2014", "tab": "\t", "par": "\r\n", "line": "\r\n"}
-_RTF_CHAR_SYMBOLS = {"\\": "\\", "{": "{", "}": "}", "~": "\u00a0", "_": "\u00ad"}
+# [MSFT-RTF] "Special Characters": a CR or LF preceded by a backslash is a \par.
+_RTF_CHAR_SYMBOLS = {"\\": "\\", "{": "{", "}": "}", "~": "\u00a0", "_": "\u00ad",
+                     "\r": "\r\n", "\n": "\r\n"}
 _RTF_TOKEN = re.compile(rb"\\([a-zA-Z]{1,32})(-?[0-9]{1,10})? ?|\\'([0-9a-fA-F]{2})|\\(.)|([{}])"
                         rb"|([^\\{}\r\n]+)|[\r\n]+", re.S)
 
@@ -1507,14 +1509,42 @@ def deencapsulate_rtf(rtf):
             pending.clear()
 
     def emit_bytes(data, cp):
+        if high[0] is not None:
+            emit("")
         if pending and pending_cp[0] != cp:
             flush()
         pending_cp[0] = cp
         pending.extend(data)
 
+    high = [None]   # a \uN high surrogate waiting for its low half
+
     def emit(text):
         flush()
+        if high[0] is not None:
+            out.append("\ufffd")  # a high surrogate with no low half after it
+            high[0] = None
         out.append(text)
+
+    def emit_unicode(value):
+        # [MSFT-RTF]: \uN is a signed 16-bit value; a character above U+FFFF is written as
+        # two \uN, its UTF-16 surrogate pair. An unpaired half, or a value outside the
+        # 16-bit range, becomes U+FFFD.
+        code = value + 65536 if value < 0 else value
+        if not 0 <= code <= 0xFFFF:
+            emit("\ufffd")
+        elif 0xD800 <= code <= 0xDBFF:
+            emit("")
+            high[0] = code
+        elif 0xDC00 <= code <= 0xDFFF:
+            if high[0] is not None:
+                pair = 0x10000 + ((high[0] - 0xD800) << 10) + (code - 0xDC00)
+                high[0] = None
+                flush()
+                out.append(chr(pair))
+            else:
+                emit("\ufffd")
+        else:
+            emit(chr(code))
 
     entry = [None, None, None]   # font table entry being read: number, charset, cpg
 
@@ -1619,11 +1649,11 @@ def deencapsulate_rtf(rtf):
                 emit(_RTF_CHAR_SYMBOLS[name])
         elif tok == "word":
             if name == "u" and value is not None:
-                emit(chr(value + 65536 if value < 0 else value))
+                emit_unicode(value)
                 skip_chars = state[UC]
             elif name in _RTF_CHAR_WORDS and not (state[HTMLTAG] and name == "line"):
                 emit(_RTF_CHAR_WORDS[name])
-    flush()
+    emit("")  # an unpaired high surrogate at the end
     return kind, "".join(out)
 
 
