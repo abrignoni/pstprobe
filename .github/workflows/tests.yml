@@ -28,8 +28,13 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       # Standard library only: the tests run with nothing installed. On Linux they run under a
-      # virtual display so the window's self-check runs too.
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y xvfb && xvfb-run -a python -m unittest discover -s tests -v
-      - if: runner.os != 'Linux'
-        run: python -m unittest discover -s tests -v
+      # virtual display; PSTPROBE_REQUIRE_GUI makes the window test fail rather than skip.
+      - name: Install a virtual display for the window test
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tk xvfb
+      - name: Run the tests (under a virtual display on Linux)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then xvfb-run -a python -m unittest discover -s tests -v; else python -m unittest discover -s tests -v; fi
+        env:
+          PSTPROBE_REQUIRE_GUI: "1"

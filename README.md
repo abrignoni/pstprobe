@@ -50,6 +50,11 @@ with an error that says so, because its content cannot be read without its key. 
 a 4 KB-page file that is both encoded and compressed: no such file has been seen, and
 the order of the two steps is not established.
 
+In a 4 KB-page OST, a heap ID splits into a 14-bit index and a 13-bit block index (from
+the PFF notes; [MS-PST] gives 11 and 16 bits for the other formats). In every OST read
+so far each heap ID names block 0 and an index below 2,048, where the two layouts agree,
+so the 4 KB split itself has been checked only against the tests' own files.
+
 "The tests' own files" are built in memory by `tests/pstbuilder.py`, which is written
 from the same layouts as the reader. They show the reader and that writer agree. That
 the reader agrees with Outlook rests on the real files above.
@@ -105,8 +110,14 @@ where each attachment belongs in that text (below). The file attachments go unde
 attached item's attachment NID to the chain (`<item NID>_<NID>_<NID>_<stored name>`),
 because attachment NIDs are local to the item that holds them. A file that already exists
 is never replaced: the write stops with an error, and an export into a folder that already
-holds an export (its `items.jsonl`) is refused before anything is written. `extract` writes every file attachment
-of the whole file, those of attached items included, with the same names.
+holds an export (its `items.jsonl`) is refused before anything is written. A stored name
+is cut to 180 bytes (UTF-8), keeping a short extension. A damaged item gets a line with
+its `error` and the export goes on; a damaged folder is counted under `errors` and named
+in `folder_errors`; a folder that a hierarchy table lists a second time is exported once
+and counted in `folders_repeated`. `extract` writes every file attachment of the whole
+file, those of attached items included, with the same names; it goes past a damaged item
+(naming it on standard error) and exits 1 if there was one. Output on standard output and
+standard error is UTF-8.
 
 Property names come from `pstprobe_names.py`, generated from [MS-OXPROPS] v20250520 by
 `tools/make_names.py` (545 PidTag and 365 PidLid names). Without that file beside it,
@@ -146,6 +157,15 @@ testing. The binaries bundle Python 3.13 with Tk 8.6.
   the stored `bytes`. Outlook has also been seen to store 8-bit text of even length under
   the PtypString type (a search folder's container class, in the Outlook PST above).
   That case cannot be told apart from real UTF-16 and decodes as unreadable text.
+- 8-bit strings (PtypString8, the strings of an ANSI file) are decoded with the item's
+  PidTagMessageCodepage, the code page [MS-OXPROPS] 2.790 gives for its non-Unicode
+  string properties; an item's recipients and attachments use the item's. A folder, the
+  store, and an item that names no code page use the file's, which [MS-PST] does not
+  record: Windows-1252 unless `--codepage N` (or `open_pst(path, codepage=N)`) says
+  otherwise. A file written on a system with another code page therefore shows wrong
+  characters in those names until the right one is given. The window always uses 1252
+  there. A PtypString8 PidTagBody is decoded with PidTagInternetCodepage, the body's code
+  page (2.747), when the item has one. Only Western (1252) ANSI files have been read.
 - `Message.subject` drops the two-character prefix marker (SOH and a length) that a
   stored subject can start with. `get(0x0037)` returns the subject as stored.
 - Named properties (IDs from 0x8000) are resolved through the store's name-to-ID map:
@@ -184,20 +204,24 @@ testing. The binaries bundle Python 3.13 with Tk 8.6.
 
 ## Binaries
 
-Each release has unsigned builds of the command line and the window for Windows, macOS
-and Linux, x64 and arm64, made by `.github/workflows/build.yml` with PyInstaller. Nothing
-to install. They are not code signed: on Windows, SmartScreen may stop them (More info,
-then Run anyway); on macOS, allow them in System Settings, Privacy & Security, or run
-`xattr -dr com.apple.quarantine` on the file or the unzipped `.app`. On Linux, mark the
-file executable first. Each build is checked in CI against the source by
-`tools/smoke_binary.py`: the same output for `info`, `folders`, `items` and `props`, the
-same files from `export`, and the window's self-check.
+`.github/workflows/build.yml` freezes the command line and the window with PyInstaller for
+Windows, macOS and Linux, x64 and arm64, and checks each build against the source with
+`tools/smoke_binary.py`: the same output for `info`, `folders`, `items`, `props`, `verify`
+and `body`, the same files from `export`, and the window's self-check. The builds of a
+release are attached to it after that check and after a run on real PST and OST files,
+and the release's `SHA256SUMS.txt` lists every file attached to it. Nothing to install.
+The builds are not code signed: on Windows, SmartScreen may stop them (More info, then
+Run anyway); on macOS, allow them in System Settings, Privacy & Security, or run
+`xattr -dr com.apple.quarantine` on the file or the unzipped `.app`. On macOS and Linux,
+a downloaded command-line file needs `chmod +x` before it runs (and so does the Linux
+window). The window builds include Tcl and Tk, whose licence terms come with them
+(`licenses/`).
 
 ## Validation
 
 `tools/compare_libpff.py` compares this reader with libpff (libpff-python 20261030),
 run as a comparison oracle in a separate environment by `tools/oracle_dump.py`. On the
-three real files it reports no difference in folders, items per folder, recipients per
+four real files below it reports no difference in folders, items per folder, recipients per
 item, attachments per item, or the data sizes of file attachments (attached items are
 compared by count only):
 

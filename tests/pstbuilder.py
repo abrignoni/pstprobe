@@ -293,7 +293,7 @@ def ac_table(row_ids):
 
 
 def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False, password=None, rtf=None,
-                 att_props=(), search_tables=False):
+                 att_props=(), search_tables=False, inbox_name="Inbox", self_loop=False):
     """A store with a root folder, one child folder 'Inbox' holding one message that has
     two recipients, one file attachment of 20,000 bytes (a data tree) and one named
     property. Returns (bytes, facts)."""
@@ -321,12 +321,14 @@ def build_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, compress=False, password
     b.node(root, b.pc([(P.PID_TAG_DISPLAY_NAME, P.PT_UNICODE, u16(""))]), parent=root)
     b.node((root & ~0x1F) | P.NID_TYPE_HIERARCHY_TABLE,
            b.tc([0x67F20003, 0x30010000 | P.PT_UNICODE],
-                [{0x67F20003: i32(inbox), 0x30010000 | P.PT_UNICODE: u16("Inbox")}]))
+                [{0x67F20003: i32(inbox), 0x30010000 | P.PT_UNICODE: u16(inbox_name)}]))
     b.node((root & ~0x1F) | P.NID_TYPE_CONTENTS_TABLE, b.tc([0x67F20003], []))
-    b.node(inbox, b.pc([(P.PID_TAG_DISPLAY_NAME, P.PT_UNICODE, u16("Inbox")),
+    b.node(inbox, b.pc([(P.PID_TAG_DISPLAY_NAME, P.PT_UNICODE, u16(inbox_name)),
                         (P.PID_TAG_CONTAINER_CLASS, P.PT_UNICODE, u16("IPF.Note")),
                         (P.PID_TAG_CONTENT_COUNT, P.PT_INT32, i32(1))]), parent=root)
-    b.node((inbox & ~0x1F) | P.NID_TYPE_HIERARCHY_TABLE, b.tc([0x67F20003], []))
+    # self_loop: the folder's hierarchy table lists the folder itself, as a damaged file can
+    b.node((inbox & ~0x1F) | P.NID_TYPE_HIERARCHY_TABLE,
+           b.tc([0x67F20003], [{0x67F20003: i32(inbox)}] if self_loop else []))
     b.node((inbox & ~0x1F) | P.NID_TYPE_CONTENTS_TABLE,
            b.tc([0x67F20003, 0x0037001F], [{0x67F20003: i32(msg), 0x0037001F: u16("\x01\x04RE: kd subject")}]))
 
@@ -376,10 +378,12 @@ class MultiHeap:
     """A heap over several blocks. Block 0 starts with HNHDR, later blocks with
     HNPAGEHDR ([MS-PST] 2.3.1.2, 2.3.1.3). Kept under 8 blocks, so no HNBITMAPHDR."""
 
-    def __init__(self, client_sig):
+    def __init__(self, client_sig, kind="unicode"):
         self.client_sig = client_sig
         self.blocks = [[]]
         self.user_root = 0
+        # The block index's place in a HID: [MS-PST] 2.3.1.1, or the PFF notes for 4 KB pages.
+        self.block_shift = 19 if kind == "unicode4k" else 16
 
     def new_block(self):
         self.blocks.append([])
@@ -387,7 +391,7 @@ class MultiHeap:
     def alloc(self, data):
         blk = len(self.blocks) - 1
         self.blocks[blk].append(bytes(data))
-        return (blk << 16) | (len(self.blocks[blk]) << 5)
+        return (blk << self.block_shift) | (len(self.blocks[blk]) << 5)
 
     def build(self):
         out = []
@@ -413,7 +417,7 @@ def build_wide_pc_sample(kind="unicode", crypt=P.CRYPT_PERMUTE, nprops=300):
     """A message store PC with nprops string properties, its BTH one index level deep,
     and the heap split over two blocks held by an XBLOCK. Returns (bytes, {pid: text})."""
     b = Builder(kind, crypt)
-    h = MultiHeap(P.CLIENT_SIG_PC)
+    h = MultiHeap(P.CLIENT_SIG_PC, kind)
     expected = {}
     recs = []
     for i in range(nprops):

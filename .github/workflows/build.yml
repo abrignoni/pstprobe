@@ -70,12 +70,19 @@ jobs:
           fi
           gh release download "${{ inputs.tag }}" -R "${{ github.repository }}" -p SHA256SUMS.txt -D _sums
           python - <<'PY'
-          import hashlib
+          import hashlib, os
+          checked = 0
           for line in open('_sums/SHA256SUMS.txt'):
               digest, name = line.split()
+              if not os.path.isfile(name):
+                  # a binary or other release file that is not in the tag
+                  print(name, 'not in the tag, not checked here')
+                  continue
               actual = hashlib.sha256(open(name, 'rb').read()).hexdigest()
               print(name, 'ok' if actual == digest else 'DIFFERS')
               assert actual == digest, name
+              checked += 1
+          assert checked, 'SHA256SUMS.txt names no file of the tag'
           PY
       # a venv holding only PyInstaller, so nothing optional on the runner is frozen in
       - name: Build environment
@@ -114,6 +121,8 @@ jobs:
         run: |
           mkdir _out _notices
           cp LICENSE _notices/LICENSE-pstprobe
+          # the window builds carry Tcl and Tk; their terms, from the Tcl/Tk 8.6 sources
+          cp licenses/LICENSE-tcl.txt licenses/LICENSE-tk.txt _notices/
           python - <<'PY'
           import glob, os, shutil, sys
           found = sorted(set(glob.glob(os.path.join(sys.base_prefix, 'LICENSE*'))

@@ -191,6 +191,127 @@ class VerifyTests(unittest.TestCase):
                 self.assertEqual(json.loads(out.getvalue())["all_match"], status == 0)
 
 
+class HardeningTests(unittest.TestCase):
+    """Damaged input, code pages and output encoding."""
+
+    class FakeNode:
+        nid = 0x21
+
+        def __init__(self, blocks, kind="ansi", codepage="cp1252"):
+            self.blocks = blocks
+            self.pst = type("FakePst", (), {"kind": kind, "codepage": codepage})()
+
+        def block(self, i):
+            return self.blocks[i]
+
+    def test_4k_heap_ids_have_a_14_bit_index(self):
+        h = pstbuilder.Heap(P.CLIENT_SIG_PC)
+        for i in range(2100):
+            h.alloc(struct.pack("<H", i))
+        data = h.build()
+        four_k = P.Heap(self.FakeNode([data], kind="unicode4k"))
+        self.assertEqual(four_k.get(2100 << 5), struct.pack("<H", 2099))
+        # the 512-byte-page layout reads index 2100 as block 0 index 52 plus a block bit
+        with self.assertRaises(P.CorruptError):
+            P.Heap(self.FakeNode([data], kind="unicode")).get(2100 << 5)
+        mh = pstbuilder.MultiHeap(P.CLIENT_SIG_PC, "unicode4k")
+        mh.alloc(b"first")
+        mh.new_block()
+        hid = mh.alloc(b"second")
+        self.assertEqual(hid, (1 << 19) | (1 << 5))
+        blocks = mh.build()
+        self.assertEqual(P.Heap(self.FakeNode(blocks, kind="unicode4k")).get(hid), b"second")
+
+    def test_8bit_strings_use_the_items_code_page(self):
+        b = pstbuilder.Builder("ansi")
+        cyr = "\u0418\u0432\u0430\u043d".encode("cp1251")
+        name = 0x3001001E
+        # PidTagMessageCodepage sorts after the name column: the row still uses it
+        tc = b.tc([0x67F20003, name, 0x3FFD0003],
+                  [{0x67F20003: pstbuilder.i32(1), name: cyr, 0x3FFD0003: pstbuilder.i32(1251)},
+                   {0x67F20003: pstbuilder.i32(2), name: cyr}])
+        rows = list(P.TableContext(self.FakeNode([tc])).rows())
+        self.assertEqual(rows[0][0x3001], "\u0418\u0432\u0430\u043d")
+        self.assertEqual(rows[1][0x3001], cyr.decode("cp1252"))
+        rows = list(P.TableContext(self.FakeNode([tc]), "cp1251").rows())
+        self.assertEqual(rows[1][0x3001], "\u0418\u0432\u0430\u043d")
+        own = b.pc([(0x3001, P.PT_STRING8, cyr), (0x3FFD, P.PT_INT32, pstbuilder.i32(1251))])
+        self.assertEqual(P.PropertyContext(self.FakeNode([own])).get(0x3001), "\u0418\u0432\u0430\u043d")
+        plain = b.pc([(0x3001, P.PT_STRING8, cyr)])
+        self.assertEqual(P.PropertyContext(self.FakeNode([plain])).get(0x3001), cyr.decode("cp1252"))
+        self.assertEqual(P.PropertyContext(self.FakeNode([plain]), "cp1251").get(0x3001), "\u0418\u0432\u0430\u043d")
+        self.assertEqual(P.PropertyContext(self.FakeNode([plain], codepage="cp1251")).get(0x3001),
+                         "\u0418\u0432\u0430\u043d")
+        # PidTagInternetCodepage names the body's code page, not the properties'
+        inet = b.pc([(0x3001, P.PT_STRING8, cyr), (0x3FDE, P.PT_INT32, pstbuilder.i32(1251))])
+        self.assertEqual(P.PropertyContext(self.FakeNode([inet])).get(0x3001), cyr.decode("cp1252"))
+        # numbers outside the cpNNNN names map through the codec table
+        ascii_ = b.pc([(0x3001, P.PT_STRING8, b"kd"), (0x3FFD, P.PT_INT32, pstbuilder.i32(20127))])
+        self.assertEqual(P.PropertyContext(self.FakeNode([ascii_])).codepage, "ascii")
+
+    def test_codepage_option(self):
+        raw, _ = pstbuilder.build_sample("ansi")
+        with P.open_pst(io.BytesIO(raw), codepage=1251) as pst:
+            self.assertEqual(pst.codepage, "cp1251")
+        with self.assertRaises(P.UnsupportedError):
+            P.open_pst(io.BytesIO(raw), codepage=99999)
+
+    def test_a_short_value_does_not_lose_the_others(self):
+        pc = pstbuilder.Builder().pc([(0x0E06, P.PT_SYSTIME, b""), (0x3001, P.PT_UNICODE, pstbuilder.u16("kd"))])
+        got = {pid: val for pid, _, val in P.PropertyContext(self.FakeNode([pc], kind="unicode")).items()}
+        self.assertIsInstance(got[0x0E06], P.CorruptError)
+        self.assertEqual(got[0x3001], "kd")
+
+    def test_export_of_a_folder_that_lists_itself(self):
+        raw, facts = pstbuilder.build_sample(self_loop=True)
+        with tempfile.TemporaryDirectory() as d, P.open_pst(io.BytesIO(raw)) as pst:
+            counts = P.export_folder(pst, pst.folder(facts["inbox"]), os.path.join(d, "out"), recursive=True)
+        self.assertEqual((counts["folders"], counts["folders_repeated"], counts["items"]), (1, 1, 1))
+
+    def test_an_xxblock_under_an_xxblock_is_refused(self):
+        # Nested XXBLOCKs pass a depth cap of 4 and multiply the work by their fan-out at
+        # each level; [MS-PST] 2.2.2.8.3.2 allows only XBLOCKs below an XXBLOCK.
+        b = pstbuilder.Builder("unicode")
+        leaf = b.data(b"kd")
+        x = 0x1000 | 2
+        inner = 0x1004 | 2
+        outer = 0x1008 | 2
+        b.blocks[x] = struct.pack("<BBHIQ", 1, 1, 1, 2, leaf)
+        b.blocks[inner] = struct.pack("<BBHIQ", 1, 2, 1, 2, x)
+        b.blocks[outer] = struct.pack("<BBHIQ", 1, 2, 1, 2, inner)
+        b.node(P.NID_MESSAGE_STORE, b.pc([]))
+        with P.open_pst(io.BytesIO(b.build())) as pst:
+            self.assertEqual(pst.data_tree(inner), [leaf])
+            with self.assertRaises(P.CorruptError):
+                pst.data_tree(outer)
+
+    def test_long_names_are_cut_by_bytes(self):
+        name = "\u6587" * 120 + ".pdf"
+        cut = P.safe_filename(name)
+        self.assertLessEqual(len(cut.encode("utf-8")), 180)
+        self.assertTrue(cut.endswith(".pdf"))
+        self.assertEqual(P.safe_filename("short.txt"), "short.txt")
+
+    def test_cli_writes_utf8_and_reports_os_errors(self):
+        import subprocess
+        raw, _ = pstbuilder.build_sample(inbox_name="\u53d7\u4fe1\u30c8\u30ec\u30a4")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pstprobe.py")
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "cjk.pst")
+            with open(path, "wb") as f:
+                f.write(raw)
+            for argv, status in ((["folders", path], 0), (["info", os.path.join(d, "missing.pst")], 1),
+                                 (["info", d], 1)):
+                done = subprocess.run([sys.executable, script] + argv, capture_output=True, env=env,
+                                      stdin=subprocess.DEVNULL, timeout=60, check=False)
+                self.assertEqual(done.returncode, status, done.stderr)
+                self.assertNotIn(b"Traceback", done.stderr)
+            done = subprocess.run([sys.executable, script, "folders", path], capture_output=True, env=env,
+                                  stdin=subprocess.DEVNULL, timeout=60, check=False)
+            self.assertIn("\u53d7\u4fe1\u30c8\u30ec\u30a4".encode("utf-8"), done.stdout)
+
+
 class RefusalTests(unittest.TestCase):
     def test_not_a_pst(self):
         with self.assertRaises(P.PSTError):
@@ -528,7 +649,7 @@ class ExportTests(unittest.TestCase):
             with P.open_pst(io.BytesIO(raw)) as pst:
                 counts = P.export_folder(pst, pst.root_folder(), d, recursive=True)
             self.assertEqual(counts, {"folders": 2, "items": 1, "attachments": 1, "rtf_bodies": 0,
-                                      "errors": 0})
+                                      "errors": 0, "folders_repeated": 0})
             inbox = os.path.join(d, "Inbox_%06x" % facts["inbox"])
             with open(os.path.join(inbox, "items.jsonl"), encoding="utf-8") as f:
                 rec = json.loads(f.readline())

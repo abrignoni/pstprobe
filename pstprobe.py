@@ -379,7 +379,16 @@ class _LRU:
 class PSTFile:
     """An open PST or OST file. Use :func:`open_pst`."""
 
-    def __init__(self, source):
+    def __init__(self, source, codepage=None):
+        # The code page for 8-bit strings ([MS-OXCDATA] PtypString8) that name none of their
+        # own. [MS-PST] records no code page for the store, so this is a choice the
+        # examiner makes: Windows-1252 unless given.
+        self.codepage = "cp1252"
+        if codepage is not None:
+            name = codepage_codec(int(codepage))
+            if name is None:
+                raise UnsupportedError("code page %s has no codec in this Python" % codepage)
+            self.codepage = name
         if hasattr(source, "read"):
             self._f = source
             self._own = False
@@ -396,7 +405,6 @@ class PSTFile:
         self._page_cache = _LRU(2048)
         self._block_cache = _LRU(256)
         self._nameid = None
-        self._codepage = None
         try:
             self._read_header()
         except Exception:
@@ -651,13 +659,18 @@ class PSTFile:
         self._data_tree_into(bid, out, 0)
         return out
 
-    def _data_tree_into(self, bid, out, depth):
+    def _data_tree_into(self, bid, out, depth, expect=None):
         if depth > 4:
             raise CorruptError("data tree deeper than XXBLOCK")
         b = self.read_block(bid)
         btype, level, c_ent = struct.unpack_from("<BBH", b, 0)
         if btype != 0x01:
             raise CorruptError("block 0x%x: btype 0x%02x where an XBLOCK was expected" % (bid, btype))
+        # [MS-PST] 2.2.2.8.3.2: an XXBLOCK (level 2) lists XBLOCKs (level 1) only, so a
+        # tree that names itself or a level-2 block below level 2 is refused.
+        if expect is not None and level != expect:
+            raise CorruptError("block 0x%x: XBLOCK level %d under a level %d block"
+                               % (bid, level, expect + 1))
         n = self.layout.id_size
         fmt = "<I" if n == 4 else "<Q"
         for i in range(c_ent):
@@ -665,7 +678,7 @@ class PSTFile:
             if level == 1:
                 out.append(child)
             elif level == 2:
-                self._data_tree_into(child, out, depth + 1)
+                self._data_tree_into(child, out, depth + 1, expect=1)
             else:
                 raise CorruptError("block 0x%x: XBLOCK level %d" % (bid, level))
 
@@ -676,7 +689,7 @@ class PSTFile:
             self._subnodes_into(bid, out, 0)
         return out
 
-    def _subnodes_into(self, bid, out, depth):
+    def _subnodes_into(self, bid, out, depth, expect=None):
         if depth > 4:
             raise CorruptError("subnode tree too deep")
         b = self.read_block(bid)
@@ -684,6 +697,10 @@ class PSTFile:
         if btype != 0x02:
             raise CorruptError("block 0x%x: btype 0x%02x where an SLBLOCK/SIBLOCK was expected"
                                % (bid, btype))
+        # [MS-PST] 2.2.2.8.3.3: an SIBLOCK (level 1) lists SLBLOCKs (level 0).
+        if level > 1 or (expect is not None and level != expect):
+            raise CorruptError("block 0x%x: subnode block level %d%s" % (
+                bid, level, "" if expect is None else " where %d was expected" % expect))
         if self.layout.id_size == 4:
             base = 4
             if level == 0:
@@ -693,7 +710,7 @@ class PSTFile:
             else:
                 for i in range(c_ent):
                     nid, child = struct.unpack_from("<II", b, base + i * 8)
-                    self._subnodes_into(child, out, depth + 1)
+                    self._subnodes_into(child, out, depth + 1, expect=0)
         else:
             base = 8
             if level == 0:
@@ -703,7 +720,7 @@ class PSTFile:
             else:
                 for i in range(c_ent):
                     nid, child = struct.unpack_from("<QQ", b, base + i * 16)
-                    self._subnodes_into(child, out, depth + 1)
+                    self._subnodes_into(child, out, depth + 1, expect=0)
 
     def node(self, nid):
         e = self.nbt_lookup(nid)
@@ -988,6 +1005,16 @@ class Heap:
         if sig != HN_SIG:
             raise CorruptError("node 0x%x: heap signature 0x%02x, expected 0xEC" % (node.nid, sig))
         self._maps = {}
+        # [MS-PST] 2.3.1.1: a HID is hidType (5 bits), hidIndex (11 bits) and hidBlockIndex
+        # (16 bits). For the 4 KB-page OST the PFF format notes ("64-bit 4k page table value
+        # reference") give a 14-bit index and a 13-bit block index. Every HID in the OSTs
+        # read so far has block index 0 and an index below 2,048, where the two agree, so
+        # the 4 KB split has not been exercised on a real file.
+        pst = getattr(node, "pst", None)
+        if pst is not None and getattr(pst, "kind", None) == "unicode4k":
+            self._index_mask, self._block_shift = 0x3FFF, 19
+        else:
+            self._index_mask, self._block_shift = 0x7FF, 16
 
     def _map(self, i):
         m = self._maps.get(i)
@@ -1008,8 +1035,8 @@ class Heap:
             return b""
         if hid & 0x1F:
             raise CorruptError("0x%x is not a HID" % hid)
-        index = (hid >> 5) & 0x7FF
-        block = hid >> 16
+        index = (hid >> 5) & self._index_mask
+        block = hid >> self._block_shift
         if block >= len(self.node.blocks):
             raise CorruptError("HID 0x%x: block %d of %d" % (hid, block, len(self.node.blocks)))
         data, offs = self._map(block)
@@ -1040,8 +1067,12 @@ def bth_items(heap, hid):
     if root == 0:
         return
     stack = [(root, levels)]
+    seen = set()
     while stack:
         h, lvl = stack.pop()
+        if h in seen:
+            raise CorruptError("BTH at 0x%x names allocation 0x%x twice" % (hid, h))
+        seen.add(h)
         data = heap.get(h)
         if lvl > 0:
             rec = cb_key + 4
@@ -1132,17 +1163,22 @@ class PropertyContext:
             ptype, hnid = struct.unpack_from("<HI", v)
             self.props[pid] = (ptype, hnid)
         self._codepage = codepage
+        self._own_codepage = None
 
     @property
     def codepage(self):
-        if self._codepage is None:
-            cp = None
-            for pid in (PID_TAG_MESSAGE_CODEPAGE, PID_TAG_INTERNET_CODEPAGE):
-                if pid in self.props and self.props[pid][0] == PT_INT32:
-                    cp = self.props[pid][1]
-                    break
-            self._codepage = "cp%d" % cp if cp else "cp1252"
-        return self._codepage
+        """The codec for this context's 8-bit strings: its own PidTagMessageCodepage
+        ([MS-OXPROPS] 2.790: "the code page used to encode the non-Unicode string
+        properties"), else the one its owner passed (an attachment gets its item's), else
+        the file's. PidTagInternetCodepage names the body's code page (2.747) and is not
+        used for properties."""
+        if self._own_codepage is None:
+            own = None
+            if PID_TAG_MESSAGE_CODEPAGE in self.props and self.props[PID_TAG_MESSAGE_CODEPAGE][0] == PT_INT32:
+                cp = self.props[PID_TAG_MESSAGE_CODEPAGE][1]
+                own = codepage_codec(cp) if cp else None
+            self._own_codepage = own or self._codepage or _file_codepage(self.node)
+        return self._own_codepage
 
     def __contains__(self, pid):
         return pid in self.props
@@ -1182,8 +1218,9 @@ class PropertyContext:
         for pid, (ptype, _) in self.props.items():
             try:
                 val = self.get(pid)
-            except PSTError as exc:
-                val = exc
+            except DAMAGE_ERRORS as exc:
+                val = exc if isinstance(exc, PSTError) else CorruptError(
+                    "property 0x%04x of node 0x%x: %s: %s" % (pid, self.node.nid, type(exc).__name__, exc))
             yield pid, ptype, val
 
 
@@ -1216,11 +1253,17 @@ def search_table_row_ids(node):
     return [rid for _, rid in rows]
 
 
+def _file_codepage(node):
+    pst = getattr(node, "pst", None)
+    return getattr(pst, "codepage", None) or "cp1252"
+
+
 class TableContext:
     """A table context ([MS-PST] 2.3.4)."""
 
-    def __init__(self, node):
+    def __init__(self, node, codepage=None):
         self.node = node
+        self.codepage = codepage or _file_codepage(node)
         self.heap = Heap(node)
         if self.heap.client_sig == CLIENT_SIG_AC:
             raise UnsupportedError("node 0x%x: table with client signature 0xAC, which [MS-PST] "
@@ -1262,6 +1305,8 @@ class TableContext:
 
     def _row_bytes(self, n):
         cb = self.row_size
+        if cb <= 0:
+            raise CorruptError("table 0x%x: row size %d" % (self.node.nid, cb))
         if self.hnid_rows == 0:
             raise CorruptError("table 0x%x has no row matrix" % self.node.nid)
         if self.hnid_rows & 0x1F == 0:
@@ -1293,7 +1338,14 @@ class TableContext:
             raise CorruptError("row %d is cut short" % n)
         ceb = raw[self.rgib[2]:self.rgib[3]]
         out = {"_row_id": row_id}
-        codepage = "cp1252"
+        codepage = self.codepage
+        # A row that holds PidTagMessageCodepage decodes its own 8-bit strings with it,
+        # whichever column comes first.
+        for tag, ib, cb, ibit in self.columns:
+            if (tag == (PID_TAG_MESSAGE_CODEPAGE << 16) | PT_INT32 and cb == 4
+                    and (ceb[ibit // 8] >> (7 - ibit % 8)) & 1):
+                cp = struct.unpack_from("<I", raw, ib)[0]
+                codepage = (codepage_codec(cp) if cp else None) or codepage
         for tag, ib, cb, ibit in self.columns:
             if not (ceb[ibit // 8] >> (7 - ibit % 8)) & 1:
                 continue
@@ -1311,11 +1363,10 @@ class TableContext:
                         val = struct.unpack_from("<II", data) if len(data) >= 8 else None
                     else:
                         val = decode_value(ptype, data, codepage)
-            except PSTError as exc:
-                val = exc
+            except DAMAGE_ERRORS as exc:
+                val = exc if isinstance(exc, PSTError) else CorruptError(
+                    "column 0x%08x of row %d: %s: %s" % (tag, n, type(exc).__name__, exc))
             out[pid] = val
-            if pid == PID_TAG_MESSAGE_CODEPAGE and isinstance(val, int) and val:
-                codepage = "cp%d" % val
         return out
 
 
@@ -1851,7 +1902,14 @@ class Message:
         return _clean_subject(self.pc.get(PID_TAG_SUBJECT))
 
     def body(self):
-        """PidTagBody, the plain-text body, as stored (str), or None."""
+        """PidTagBody, the plain-text body (str), or None. Stored as PtypString8, it is
+        decoded with PidTagInternetCodepage, which names the body's code page ([MS-OXPROPS]
+        2.747), when the item has one this Python can decode, else as other 8-bit strings."""
+        if self.pc.ptype(PID_TAG_BODY) == PT_STRING8:
+            cp = self.pc.get(PID_TAG_INTERNET_CODEPAGE)
+            codec = codepage_codec(cp) if isinstance(cp, int) and cp > 0 else None
+            if codec:
+                return decode_value(PT_STRING8, self.pc.raw(PID_TAG_BODY), codec)
         return self.pc.get(PID_TAG_BODY)
 
     def html_body(self):
@@ -1927,7 +1985,7 @@ class Message:
 
     def recipient_table(self):
         sub = self.node.subnode(NID_RECIPIENT_TABLE)
-        return TableContext(sub) if sub else None
+        return TableContext(sub, self.pc.codepage) if sub else None
 
     def recipients(self):
         t = self.recipient_table()
@@ -1935,7 +1993,7 @@ class Message:
 
     def attachment_table(self):
         sub = self.node.subnode(NID_ATTACHMENT_TABLE)
-        return TableContext(sub) if sub else None
+        return TableContext(sub, self.pc.codepage) if sub else None
 
     def attachment_nids(self):
         t = self.attachment_table()
@@ -1958,7 +2016,7 @@ class Attachment:
         self.pst = message.pst
         self.node = node
         self.nid = node.nid
-        self.pc = PropertyContext(node)
+        self.pc = PropertyContext(node, message.pc.codepage)
 
     def __repr__(self):
         return "Attachment(0x%x, %r)" % (self.nid, self.filename)
@@ -2101,7 +2159,16 @@ def safe_filename(name, fallback="attachment"):
         name = fallback
     if name.split(".")[0].upper() in _RESERVED:
         name = "_" + name
-    return name[:180]
+    # At most 180 bytes in UTF-8, so the name with its NID prefix stays under the 255-byte
+    # limit of ext4 and APFS. The extension is kept when it is short.
+    if len(name.encode("utf-8")) > 180:
+        stem, dot, ext = name.rpartition(".")
+        if not dot or not stem or len(ext.encode("utf-8")) > 16:
+            stem, ext = name, ""
+        room = 180 - (len(ext.encode("utf-8")) + 1 if ext else 0)
+        stem = stem.encode("utf-8")[:room].decode("utf-8", "ignore")
+        name = stem + ("." + ext if ext else "")
+    return name
 
 
 def attachment_file_name(message, attachment, chain=None):
@@ -2220,7 +2287,8 @@ def export_folder(pst, folder, outdir, recursive=False, cancel=None, progress=No
     """Write a folder's items to outdir/items.jsonl (one item_record per line) and their file
     attachments to outdir/attachments/. With recursive, each subfolder goes to a folder of its
     own below, named from its display name and NID. Returns counts."""
-    counts = {"folders": 0, "items": 0, "attachments": 0, "rtf_bodies": 0, "errors": 0}
+    counts = {"folders": 0, "items": 0, "attachments": 0, "rtf_bodies": 0, "errors": 0,
+              "folders_repeated": 0}
 
     def one(f, target):
         os.makedirs(target, exist_ok=True)
@@ -2231,8 +2299,14 @@ def export_folder(pst, folder, outdir, recursive=False, cancel=None, progress=No
         att_dir = os.path.join(target, "attachments")
         body_dir = os.path.join(target, "bodies")
         counts["folders"] += 1
+        try:
+            nids = f.message_nids()
+        except DAMAGE_ERRORS as exc:
+            nids = []
+            counts["errors"] += 1
+            counts.setdefault("folder_errors", []).append("0x%x contents table: %s" % (f.nid, exc))
         with open(listing, "x", encoding="utf-8", newline="\n") as out:
-            for nid in f.message_nids():
+            for nid in nids:
                 if cancel is not None and cancel():
                     raise PSTError("cancelled")
                 try:
@@ -2263,9 +2337,22 @@ def export_folder(pst, folder, outdir, recursive=False, cancel=None, progress=No
             json.dump({"nid": f.nid, "path": f.path, "container_class": jsonable(f.container_class),
                        "properties": properties_record(f.pc, pst)}, out, ensure_ascii=False, indent=1)
         if recursive:
-            for sub in f.subfolders():
-                one(sub, os.path.join(target, "%s_%06x" % (safe_filename(sub.name, "folder"), sub.nid)))
+            for nid in f.subfolder_nids():
+                if nid in seen:
+                    # a hierarchy table that lists a folder again (or the folder itself)
+                    counts["folders_repeated"] += 1
+                    continue
+                seen.add(nid)
+                try:
+                    sub = pst.folder(nid, f.path)
+                except DAMAGE_ERRORS as exc:
+                    counts["errors"] += 1
+                    counts.setdefault("folder_errors", []).append("0x%x: %s" % (nid, exc))
+                    continue
+                if sub is not None:
+                    one(sub, os.path.join(target, "%s_%06x" % (safe_filename(sub.name, "folder"), sub.nid)))
 
+    seen = {folder.nid}
     one(folder, outdir)
     return counts
 
@@ -2295,9 +2382,10 @@ def find_folder(pst, spec):
     return None
 
 
-def open_pst(source):
-    """Open a PST or OST file by path or binary file object."""
-    return PSTFile(source)
+def open_pst(source, codepage=None):
+    """Open a PST or OST file by path or binary file object. codepage (a Windows code page
+    number) decodes the 8-bit strings that do not name their own; the default is 1252."""
+    return PSTFile(source, codepage)
 
 
 # ---------------------------------------------------------------------------
@@ -2360,7 +2448,13 @@ def _message_summary(m):
 
 def _cmd_items(pst, args):
     for f in pst.walk_folders():
-        for nid in f.message_nids():
+        try:
+            nids = f.message_nids()
+        except DAMAGE_ERRORS as exc:
+            print(json.dumps({"folder": f.path, "folder_nid": f.nid,
+                              "error": "contents table: %s" % exc}, ensure_ascii=False))
+            continue
+        for nid in nids:
             try:
                 m = pst.message(nid)
                 if m is None:
@@ -2419,13 +2513,27 @@ def _cmd_body(pst, args):
 
 def _cmd_extract(pst, args):
     os.makedirs(args.output, exist_ok=True)
-    count = 0
+    count = errors = 0
     for f in pst.walk_folders():
-        for m in f.messages():
-            for name, a in iter_file_attachments(m):
-                write_attachment(a, os.path.join(args.output, name))
-                count += 1
-    print("%d attachments written to %s" % (count, args.output))
+        try:
+            nids = f.message_nids()
+        except DAMAGE_ERRORS as exc:
+            print("pstprobe: folder 0x%x: contents table: %s" % (f.nid, exc), file=sys.stderr)
+            errors += 1
+            continue
+        for nid in nids:
+            try:
+                m = pst.message(nid)
+                if m is None:
+                    continue
+                for name, a in iter_file_attachments(m):
+                    write_attachment(a, os.path.join(args.output, name))
+                    count += 1
+            except DAMAGE_ERRORS as exc:
+                print("pstprobe: item 0x%x: %s" % (nid, exc), file=sys.stderr)
+                errors += 1
+    print("%d attachments written to %s, %d errors" % (count, args.output, errors))
+    return 1 if errors else 0
 
 
 def _cmd_export(pst, args):
@@ -2457,6 +2565,9 @@ def main(argv=None):
                            ("verify", "check the stored CRCs of the header, B-tree pages and blocks")):
         s = sub.add_parser(name, help=helptext)
         s.add_argument("file")
+        s.add_argument("--codepage", type=int, metavar="N",
+                       help="Windows code page for 8-bit strings that do not name their own "
+                            "(default 1252); see the README")
         if name == "items":
             s.add_argument("--subjects", action="store_true", help="include subjects")
         if name == "props":
@@ -2475,13 +2586,26 @@ def main(argv=None):
             s.add_argument("--folder", help="NID or path as `folders` prints it (default: the root)")
             s.add_argument("--recursive", action="store_true", help="include subfolders")
     args = p.parse_args(argv)
+    # Names and text in a mailbox can be in any script. Write UTF-8 whatever the console or
+    # a redirect would otherwise use (on Windows, often cp1252), as the frozen builds do.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="backslashreplace")
+            except (ValueError, OSError):
+                pass
     try:
-        with open_pst(args.file) as pst:
+        with open_pst(args.file, codepage=args.codepage) as pst:
             status = {"info": _cmd_info, "folders": _cmd_folders, "items": _cmd_items,
                       "props": _cmd_props, "body": _cmd_body, "extract": _cmd_extract,
                       "export": _cmd_export, "verify": _cmd_verify}[args.cmd](pst, args)
     except PSTError as exc:
         print("pstprobe: %s" % exc, file=sys.stderr)
+        return 1
+    except UnicodeEncodeError as exc:
+        # the output could not take a character; the file is not at fault
+        print("pstprobe: the output cannot hold a character (%s)" % exc, file=sys.stderr)
         return 1
     except DAMAGE_ERRORS as exc:
         print("pstprobe: a structure in the file is damaged (%s: %s)" % (type(exc).__name__, exc),
@@ -2489,6 +2613,9 @@ def main(argv=None):
         return 1
     except FileExistsError as exc:
         print("pstprobe: will not replace %s" % exc.filename, file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print("pstprobe: %s" % exc, file=sys.stderr)
         return 1
     return status or 0
 
