@@ -25,6 +25,7 @@ which is LGPL, or from any other PST implementation. This file is MIT.
 """
 
 import argparse
+import codecs
 import datetime
 import errno
 import json
@@ -1368,6 +1369,264 @@ def rtf_header(data):
             "crc": crc}
 
 
+# ---------------------------------------------------------------------------
+# RTF de-encapsulation, [MS-OXRTFEX] v20250520 2.2.3, over the RTF syntax of [MSFT-RTF]
+# (Rich Text Format Specification 1.9.1, 2008)
+
+# Every control word that the index of [MSFT-RTF] (Appendix B) lists as a destination. A
+# group that starts with one of these, or with \*, holds no visible text of the document and
+# is skipped, except the ones below that are read.
+_RTF_DESTINATIONS = frozenset((
+    "aftncn aftnsep aftnsepc annotation atnauthor atndate atnicn atnid atnparent atnref atntime "
+    "atrfend atrfstart author background bkmkend bkmkstart blipuid buptim category "
+    "colorschememapping colortbl comment company creatim datafield datastore defchp defpap do "
+    "doccomm docvar dptxbxtext ebcend ebcstart factoidname falt fchars ffdeftext ffentrymcr "
+    "ffexitmcr ffformat ffhelptext ffl ffname ffstattext field file filetbl fldinst fldrslt "
+    "fldtype fname fontemb fontfile fonttbl footer footerf footerl footerr footnote formfield "
+    "ftncn ftnsep ftnsepc g generator gridtbl header headerf headerl headerr hl hlfr hlinkbase "
+    "hlloc hlsrc hsv htmltag info keycode keywords latentstyles lchars levelnumbers leveltext "
+    "lfolevel linkval list listlevel listname listoverride listoverridetable listpicture "
+    "liststylename listtable listtext lsdlockedexcept macc maccPr mailmerge maln malnScr manager "
+    "margPr mbar mbarPr mbaseJc mbegChr mborderBox mborderBoxPr mbox mboxPr mchr mcount mctrlPr "
+    "md mdPr mdeg mdegHide mden mdiff me mendChr meqArr meqArrPr mf mfName mfPr mfunc mfuncPr "
+    "mgroupChr mgroupChrPr mgrow mhideBot mhideLeft mhideRight mhideTop mhtmltag mlim mlimloc "
+    "mlimlow mlimlowPr mlimupp mlimuppPr mm mmPr mmaddfieldname mmath mmathPict mmathPr mmaxdist "
+    "mmc mmcJc mmcPr mmconnectstr mmconnectstrdata mmcs mmdatasource mmheadersource mmmailsubject "
+    "mmodso mmodsofilter mmodsofldmpdata mmodsomappedname mmodsoname mmodsorecipdata mmodsosort "
+    "mmodsosrc mmodsotable mmodsoudl mmodsoudldata mmodsouniquetag mmquery mmr mnary mnaryPr "
+    "mnoBreak mnum moMath moMathPara moMathParaPr mobjDist mopEmu mphant mphantPr mplcHide mpos "
+    "mr mrPr mrad mradPr msPre msPrePr msSub msSubPr msSubSup msSubSupPr msSup msSupPr msepChr "
+    "mshow mshp mstrikeBLTR mstrikeH mstrikeTLBR mstrikeV msub msubHide msup msupHide mtransp "
+    "mtype mvertJc mvfmf mvfml mvtof mvtol mzeroAsc mzeroDesc mzeroWid nesttableprops nextfile "
+    "nonesttables objalias objclass objdata object objname objsect objtime oldcprops oldpprops "
+    "oldsprops oldtprops oleclsid operator panose password passwordhash pgp pgptbl picprop pict "
+    "pn pnseclvl pntext pntxta pntxtb printim private propname protend protstart protusertbl pxe "
+    "result revtbl revtim rsidtbl rxe shp shpgrp shpinst shppict shprslt shptxt sn sp staticval "
+    "stylesheet subject sv svb tc template themedata title txe ud upr userprops wgrffmtfilter "
+    "windowcaption writereservation writereservhash xe xform xmlattrname xmlattrvalue xmlclose "
+    "xmlname xmlnstbl xmlopen "
+).split())
+
+# [MSFT-RTF], "Font Table": \fcharsetN -> code page (Windows and Mac names in the comment there).
+_RTF_CHARSET_CODEPAGE = {0: 1252, 2: 42, 77: 10000, 78: 10001, 79: 10003, 80: 10008, 81: 10002,
+                         83: 10005, 84: 10004, 85: 10006, 86: 10081, 87: 10021, 88: 10029,
+                         89: 10007, 128: 932, 129: 949, 130: 1361, 134: 936, 136: 950, 161: 1253,
+                         162: 1254, 163: 1258, 177: 1255, 178: 1256, 186: 1257, 204: 1251, 222: 874,
+                         238: 1250, 254: 437, 255: 850}
+# Code page numbers Python does not know as "cp<number>".
+_CODEPAGE_CODECS = {10000: "mac-roman", 10006: "mac-greek", 10007: "mac-cyrillic",
+                    10029: "mac-latin2", 10081: "mac-turkish", 20127: "ascii", 28591: "latin-1",
+                    28592: "iso8859-2", 28605: "iso8859-15", 20866: "koi8-r", 50220: "iso2022-jp",
+                    51932: "euc-jp", 51949: "euc-kr", 54936: "gb18030", 65000: "utf-7",
+                    65001: "utf-8"}
+# [MS-OXRTFEX] 2.1.3.1.4.2 and [MSFT-RTF] "Special Characters": control words that stand
+# for a character.
+_RTF_CHAR_WORDS = {"lquote": "\u2018", "rquote": "\u2019", "ldblquote": "\u201c",
+                   "rdblquote": "\u201d", "bullet": "\u2022", "endash": "\u2013",
+                   "emdash": "\u2014", "tab": "\t", "par": "\r\n", "line": "\r\n"}
+_RTF_CHAR_SYMBOLS = {"\\": "\\", "{": "{", "}": "}", "~": "\u00a0", "_": "\u00ad"}
+_RTF_TOKEN = re.compile(rb"\\([a-zA-Z]{1,32})(-?[0-9]{1,10})? ?|\\'([0-9a-fA-F]{2})|\\(.)|([{}])"
+                        rb"|([^\\{}\r\n]+)|[\r\n]+", re.S)
+
+
+def codepage_codec(codepage):
+    """A Python codec name for a Windows code page number, or None."""
+    name = _CODEPAGE_CODECS.get(codepage, "cp%d" % codepage)
+    try:
+        codecs.lookup(name)
+    except LookupError:
+        return None
+    return name
+
+
+def _rtf_tokens(rtf):
+    """(kind, name, value) tuples: ("word", name, param or None), ("hex", byte), ("sym", ch),
+    ("open",), ("close",), ("text", bytes), ("bin", bytes)."""
+    pos, n = 0, len(rtf)
+    while pos < n:
+        m = _RTF_TOKEN.match(rtf, pos)
+        if m is None:  # a lone backslash at the very end
+            return
+        pos = m.end()
+        word, param, hexpair, sym, brace, text = m.groups()
+        if word is not None:
+            value = int(param) if param is not None else None
+            if word == b"bin" and value:
+                # [MSFT-RTF]: \binN is followed by N bytes of binary data
+                yield ("bin", rtf[pos:pos + value], None)
+                pos += value
+                continue
+            yield ("word", word.decode("ascii"), value)
+        elif hexpair is not None:
+            yield ("hex", int(hexpair, 16), None)
+        elif sym is not None:
+            yield ("sym", sym.decode("latin-1"), None)
+        elif brace is not None:
+            yield ("open" if brace == b"{" else "close", None, None)
+        elif text is not None:
+            yield ("text", text, None)
+
+
+def rtf_encapsulation(rtf):
+    """"html" for \\fromhtml1, "text" for \\fromtext, or None, by [MS-OXRTFEX] 2.2.3.1: the
+    RTF starts with "{\\rtf1" and one of the first 10 tokens, all of them group openings or
+    control words, is the control word."""
+    if not rtf.startswith(b"{\\rtf1"):
+        return None
+    for count, (kind, name, value) in enumerate(_rtf_tokens(rtf)):
+        if count >= 10 or kind not in ("open", "word"):
+            return None
+        if kind == "word" and name == "fromhtml" and value == 1:
+            return "html"
+        if kind == "word" and name == "fromtext" and value is None:
+            return "text"
+    return None
+
+
+def deencapsulate_rtf(rtf):
+    """The HTML or plain text that an RTF body encapsulates, [MS-OXRTFEX] 2.2.3.2 and 2.2.3.3.
+
+    Returns (kind, text) with kind "html" or "text", or (None, None) when the RTF does not
+    encapsulate either. Text runs are decoded by the current font's code page (\\cpgN, else
+    \\fcharsetN, in the font table), else the document's \\ansicpgN, else 1252; HTMLTAG content
+    by the document's code page. A code page Python has no codec for is decoded as cp1252.
+    """
+    kind = rtf_encapsulation(rtf)
+    if kind is None:
+        return None, None
+    fonts = {}          # font number -> code page
+    default_cp = 1252
+    out = []
+    pending = bytearray()
+    pending_cp = [None]
+
+    def flush():
+        if pending:
+            codec = codepage_codec(pending_cp[0] or default_cp) or "cp1252"
+            out.append(bytes(pending).decode(codec, errors="replace"))
+            pending.clear()
+
+    def emit_bytes(data, cp):
+        if pending and pending_cp[0] != cp:
+            flush()
+        pending_cp[0] = cp
+        pending.extend(data)
+
+    def emit(text):
+        flush()
+        out.append(text)
+
+    entry = [None, None, None]   # font table entry being read: number, charset, cpg
+
+    def commit_font():
+        if entry[0] is not None:
+            fonts[entry[0]] = entry[2] or _RTF_CHARSET_CODEPAGE.get(entry[1])
+        entry[:] = [None, None, None]
+
+    # Per group, inherited by nested groups and restored on leaving them.
+    SKIP, HTMLRTF, UC, FONT, HTMLTAG, FONTTBL, UPR, FIRST = range(8)
+    state = [False, False, 1, None, False, False, False, True]
+    stack = []
+    skip_chars = 0
+    starred = False
+    for tok, name, value in _rtf_tokens(rtf):
+        if tok == "open":
+            stack.append(state)
+            state = list(state)
+            state[FIRST] = True
+            starred = False
+            skip_chars = 0  # [MSFT-RTF]: skippable data ends at a brace
+            continue
+        if tok == "close":
+            if state[FONTTBL]:
+                commit_font()
+            if not stack:
+                break
+            state = stack.pop()
+            skip_chars = 0
+            continue
+        first, state[FIRST] = state[FIRST], False
+        if tok == "sym" and name == "*" and first:
+            starred = True
+            state[FIRST] = True  # the destination's control word comes next
+            continue
+        if tok == "word" and first:
+            was_starred, starred = starred, False
+            if state[UPR]:
+                # \upr holds an ANSI group and a {\*\ud ...} group: read the Unicode one
+                state[UPR] = False
+                state[SKIP] = state[SKIP] or not (was_starred and name == "ud")
+                if name == "ud":
+                    continue
+            if name == "fonttbl":
+                state[FONTTBL] = True
+                continue
+            if name == "htmltag" and kind == "html":
+                state[HTMLTAG] = True
+                continue
+            if name == "upr":
+                state[UPR] = True
+                continue
+            if name in ("field", "fldrslt", "ud"):
+                continue  # a field's result is visible text; its instruction is skipped
+            if was_starred or name in _RTF_DESTINATIONS:
+                state[SKIP] = True
+                continue
+        elif first and state[UPR]:
+            state[SKIP] = True
+        if state[FONTTBL]:
+            if tok == "word":
+                if name == "f" and value is not None:
+                    commit_font()
+                    entry[0] = value
+                elif name == "fcharset":
+                    entry[1] = value
+                elif name == "cpg":
+                    entry[2] = value
+            continue
+        if tok == "word" and name == "ansicpg" and value:
+            default_cp = value
+            continue
+        if tok == "word" and name == "f" and value is not None and not state[HTMLTAG]:
+            state[FONT] = value  # tracked even where \htmlrtf suppresses output, 2.2.3.2
+            continue
+        if state[SKIP]:
+            continue
+        if tok == "word" and name == "htmlrtf" and not state[HTMLTAG]:
+            state[HTMLRTF] = value != 0
+            continue
+        if tok == "word" and name == "uc":
+            state[UC] = value if value is not None else 1
+            continue
+        if skip_chars:
+            # [MSFT-RTF] \uN: the next \ucN characters are its fallback. A control word, a
+            # \'hh, a byte of text and \binN with its data each count as one.
+            if tok == "text" and len(name) > skip_chars:
+                name = name[skip_chars:]
+                skip_chars = 0
+            else:
+                skip_chars -= len(name) if tok == "text" else 1
+                continue
+        if state[HTMLRTF] and not state[HTMLTAG]:
+            continue
+        cp = default_cp if state[HTMLTAG] else (fonts.get(state[FONT]) or default_cp)
+        if tok == "text":
+            emit_bytes(name, cp)
+        elif tok == "hex":
+            emit_bytes(bytes((name,)), cp)
+        elif tok == "sym":
+            if name in _RTF_CHAR_SYMBOLS:
+                emit(_RTF_CHAR_SYMBOLS[name])
+        elif tok == "word":
+            if name == "u" and value is not None:
+                emit(chr(value + 65536 if value < 0 else value))
+                skip_chars = state[UC]
+            elif name in _RTF_CHAR_WORDS and not (state[HTMLTAG] and name == "line"):
+                emit(_RTF_CHAR_WORDS[name])
+    flush()
+    return kind, "".join(out)
+
+
 class Message:
     def __init__(self, pst, node):
         self.pst = pst
@@ -1412,6 +1671,15 @@ class Message:
         if not isinstance(value, (bytes, bytearray)):
             raise CorruptError("PidTagRtfCompressed of message 0x%x is not binary" % self.nid)
         return decompress_rtf(value)
+
+    def rtf_original(self):
+        """The plain text or HTML the RTF body encapsulates ([MS-OXRTFEX]), as (kind, str)
+        with kind "text" or "html"; (None, None) when there is no RTF body or it encapsulates
+        nothing. Raises CorruptError if the stored RTF is damaged."""
+        rtf = self.rtf_body()
+        if rtf is None:
+            return None, None
+        return deencapsulate_rtf(rtf)
 
     def recipient_table(self):
         sub = self.node.subnode(NID_RECIPIENT_TABLE)
@@ -1613,6 +1881,15 @@ def iter_file_attachments(message, chain=None, depth=0):
             yield attachment_file_name(message, a, chain), a
 
 
+def rtf_original_bytes(kind, text):
+    """How `body --format from-rtf` and export write a de-encapsulated body: plain text as
+    UTF-8; HTML as ASCII with every other character as a numeric character reference, which
+    reads the same under whatever charset the HTML itself declares."""
+    if kind == "html":
+        return text.encode("ascii", errors="xmlcharrefreplace")
+    return text.encode("utf-8")
+
+
 def write_attachment(attachment, path):
     """Copy an attachment's data to a new file at path, in pieces. Refuses to replace a file
     that exists. Returns the bytes written."""
@@ -1646,6 +1923,12 @@ def item_record(message, attachments_dir=None, rel_dir="attachments", depth=0, c
                 with open(os.path.join(bodies_dir, name), "xb") as out:
                     out.write(rtf)
                 rec["rtf_file"] = bodies_rel + "/" + name
+                kind, text = deencapsulate_rtf(rtf)
+                if kind is not None:
+                    name = "%s.from-rtf.%s" % (chain, "html" if kind == "html" else "txt")
+                    with open(os.path.join(bodies_dir, name), "xb") as out:
+                        out.write(rtf_original_bytes(kind, text))
+                    rec["rtf_original_file"] = bodies_rel + "/" + name
         except DAMAGE_ERRORS as exc:
             rec["rtf_error"] = str(exc)
     try:
@@ -1864,6 +2147,9 @@ def _cmd_body(pst, args):
         raise PSTError("no node 0x%x" % nid)
     if args.format == "rtf":
         data = m.rtf_body()
+    elif args.format == "from-rtf":
+        kind, text = m.rtf_original()
+        data = rtf_original_bytes(kind, text) if kind is not None else None
     elif args.format == "html":
         data = m.html_body()
         if isinstance(data, str):
@@ -1873,7 +2159,8 @@ def _cmd_body(pst, args):
         if isinstance(data, str):
             data = data.encode("utf-8")
     if data is None:
-        raise PSTError("message 0x%x has no %s body" % (nid, args.format))
+        raise PSTError("message 0x%x has no %s body" % (
+            nid, "RTF body that encapsulates text or HTML" if args.format == "from-rtf" else args.format))
     if args.output:
         with open(args.output, "xb") as out:
             out.write(data)
@@ -1910,7 +2197,7 @@ def main(argv=None):
                            ("folders", "folder tree with item counts"),
                            ("items", "one JSON line per item: class, recipients, attachments"),
                            ("props", "every property of one node"),
-                           ("body", "one item's body: plain text, HTML, or RTF decompressed"),
+                           ("body", "one item's body: plain text, HTML, RTF, or what RTF encapsulates"),
                            ("extract", "write every file attachment to a folder"),
                            ("export", "write a folder's items (JSON lines) and attachments")):
         s = sub.add_parser(name, help=helptext)
@@ -1921,9 +2208,11 @@ def main(argv=None):
             s.add_argument("nid", help="node ID, e.g. 0x21 or 2097188")
         if name == "body":
             s.add_argument("nid", help="the item's node ID")
-            s.add_argument("--format", choices=("text", "html", "rtf"), default="text",
+            s.add_argument("--format", choices=("text", "html", "rtf", "from-rtf"), default="text",
                            help="text is PidTagBody (UTF-8 out), html PidTagBodyHtml, rtf "
-                                "PidTagRtfCompressed decompressed (default: text)")
+                                "PidTagRtfCompressed decompressed, from-rtf the text (UTF-8) or "
+                                "HTML (ASCII with character references) it encapsulates "
+                                "(default: text)")
             s.add_argument("-o", "--output", help="write to this file (refuses to replace one)")
         if name in ("extract", "export"):
             s.add_argument("-o", "--output", required=True)

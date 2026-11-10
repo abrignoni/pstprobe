@@ -178,21 +178,34 @@ def _shown(text):
 # kind -> (button label, how to read it, how to show it, file extension)
 _BODY_KINDS = (
     ('text', 'Plain text (0x1000)', lambda m: m.body(), _shown, '.txt'),
-    ('html', 'HTML source (0x1013)', lambda m: m.html_body(), None, '.html'),
-    ('rtf', 'RTF source (0x1009, decompressed)', lambda m: m.rtf_body(),
+    ('html', 'HTML (0x1013)', lambda m: m.html_body(), None, '.html'),
+    ('rtf', 'RTF (0x1009)', lambda m: m.rtf_body(),
      lambda v: _shown(v.decode('latin-1')), '.rtf'),
+    ('from-rtf', 'Text or HTML in the RTF', None, None, None),
 )
 
 
 def item_bodies(message):
-    """kind -> (text to show, bytes to save) for each body the item stores; a damaged one
-    shows its error and saves nothing."""
+    """kind -> (text to show, bytes to save, file extension) for each body the item stores,
+    and for the text or HTML its RTF body encapsulates; a damaged one shows its error and
+    saves nothing."""
     out = {}
     for kind, _label, read, show, _ext in _BODY_KINDS:
+        if kind == 'from-rtf':
+            try:
+                inner, text = message.rtf_original()
+            except pstprobe.DAMAGE_ERRORS as error:
+                if 'rtf' in out and out['rtf'][1] is not None:
+                    out[kind] = ('error: %s' % error, None, None)
+                continue
+            if inner is not None:
+                out[kind] = (_shown(text), pstprobe.rtf_original_bytes(inner, text),
+                             '.html' if inner == 'html' else '.txt')
+            continue
         try:
             value = read(message)
         except pstprobe.DAMAGE_ERRORS as error:
-            out[kind] = ('error: %s' % error, None)
+            out[kind] = ('error: %s' % error, None, None)
             continue
         if value is None:
             continue
@@ -202,9 +215,9 @@ def item_bodies(message):
                 codepage = message.get(0x3FDE)  # PidTagInternetCodepage
             except pstprobe.DAMAGE_ERRORS:
                 codepage = None
-            out[kind] = (_shown(_decode_html(value, codepage)), raw)
+            out[kind] = (_shown(_decode_html(value, codepage)), raw, _ext)
         else:
-            out[kind] = (show(value), raw)
+            out[kind] = (show(value), raw, _ext)
     return out
 
 
@@ -345,7 +358,8 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                                      command=self._show_body, state='disabled')
             button.pack(side='left', padx=(0, 10))
             self.body_buttons[kind] = button
-        ttk.Button(bar, text='Save Body...', command=self.save_body).pack(side='right')
+        self.save_body_button = ttk.Button(bar, text='Save Body...', command=self.save_body)
+        self.save_body_button.pack(side='right')
         self.body = tk.Text(body, wrap='word', state='disabled', borderwidth=0, highlightthickness=0)
         self.body.pack(fill='both', expand=True)
         self.bodies = {}
@@ -606,7 +620,8 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         self.bodies = bodies
         for kind, button in self.body_buttons.items():
             button.configure(state='normal' if kind in bodies else 'disabled')
-        first = next((kind for kind, *_rest in _BODY_KINDS if kind in bodies), None)
+        # the first stored of plain text, HTML, what the RTF wraps, RTF
+        first = next((kind for kind in ('text', 'html', 'from-rtf', 'rtf') if kind in bodies), None)
         if first is not None:
             self.body_kind.set(first)
         self._show_body()
@@ -623,7 +638,7 @@ class Window:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         if self.message is None or not shown or shown[1] is None:
             self.set_status('Select an item with a body first.')
             return None
-        ext = next(e for kind, _l, _r, _s, e in _BODY_KINDS if kind == self.body_kind.get())
+        ext = shown[2]
         target = target or filedialog.asksaveasfilename(
             title='Save body', parent=self.root, defaultextension=ext,
             initialfile='%06x_body%s' % (self.message.nid, ext))

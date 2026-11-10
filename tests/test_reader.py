@@ -260,6 +260,118 @@ class RtfTests(unittest.TestCase):
                 self.assertEqual(f.read(), P.decompress_rtf(RTF_EXAMPLE_1))
 
 
+# [MS-OXRTFEX] v20250520 3.1, as printed (one line's indent, a page break in the PDF, removed).
+RTFEX_EXAMPLE_3_1 = (
+    b'{\\rtf1\\ANSI\\ansicpg1251\\fromhtml1 \\deff0\n'
+    b'{\\fonttbl {\\f0\\fmodern Courier New;}{\\f1\\fswiss Arial;}{\\f2\\fswiss\\fcharset0 Arial;}}\n'
+    b'{\\colortbl\\red0\\green0\\blue0;\\red0\\green0\\blue255;}\n'
+    b'{\\*\\htmltag64}\n'
+    b'\\uc1\\pard\\plain\\deftab360 \\f0\\fs24\n'
+    b'{\\*\\htmltag <HTML><head>\\par\n'
+    b'<style>\\par\n'
+    b'<!--\\par\n'
+    b' /* Style Definitions */\\par\n'
+    b' p.MsoNormal, li.MsoNormal \\{font-family:Arial;\\}\\par\n'
+    b'-->\\par\n'
+    b'</style>\\par\n'
+    b'\\tab <!-- This is a HTML comment.\\par\n'
+    b'There is a horizontal tab (%x09) character before the comment, \\par\n'
+    b'and some new lines inside the comment. -->\\par\n'
+    b'</head>\\par\n'
+    b'<body>\\par\n'
+    b'<p\\par\n'
+    b'class="MsoNormal">}\n'
+    b'{\\htmlrtf \\f1 \\htmlrtf0 Note the line break inside a P tag. {\\*\\htmltag <b>}{\\htmlrtf \\b\n'
+    b'\\htmlrtf0 This is a bold text{\\*\\htmltag </b>}} \\htmlrtf\\par\\htmlrtf0}\n'
+    b'\\htmlrtf \\par \\htmlrtf0\n'
+    b'{\\*\\htmltag </p>\\par\n'
+    b'<p class="MsoNormal">\\par}\n'
+    b'{\\htmlrtf \\f1 \\htmlrtf0 This is a normal text with a character references:\n'
+    b"{\\*\\htmltag &nbsp;}\\htmlrtf \\'a0\\htmlrtf0 {\\*\\htmltag &lt;}\\htmlrtf <\\htmlrtf0 {\\*\\htmltag\n"
+    b"&uml;}\\htmlrtf {\\f2\\'a8}\\htmlrtf0{\\*\\htmltag <br>\\par}\\htmlrtf\\line\\htmlrtf0\n"
+    b'characters which have special meaning in RTF: \\{\\}\\\\{\\*\\htmltag\n'
+    b'<br>\\par}\\htmlrtf\\line\\htmlrtf0\\htmlrtf\\par\\htmlrtf0}\n'
+    b'{\\*\\htmltag </p>\\par\n'
+    b'<ol>\\par\n'
+    b'<li class="MsoNormal">}{\\htmlrtf\n'
+    b'{{\\*\\pn\\pnlvlbody\\pndec\\pnstart1\\pnindent360{\\pntxta.}}\\li360\\fi-360{\\pntext 1.\\tab} \\f1\n'
+    b'\\htmlrtf0 This is a list item}\\htmlrtf\\par\\htmlrtf0}\n'
+    b'{\\*\\htmltag \\par\n'
+    b'</ol>\\par\n'
+    b'</body>\\par\n'
+    b'</HTML>\\par }}\n'
+)
+
+
+class RtfDeencapsulationTests(unittest.TestCase):
+    def test_spec_example(self):
+        kind, html = P.deencapsulate_rtf(RTFEX_EXAMPLE_3_1)
+        self.assertEqual(kind, "html")
+        # The specification's source HTML for this example, with the three places where its
+        # own RTF says otherwise: "a bold", "which", and no space before each entity (each
+        # space in the RTF there ends a control word).
+        want = ('<HTML><head>\r\n<style>\r\n<!--\r\n /* Style Definitions */\r\n'
+                ' p.MsoNormal, li.MsoNormal {font-family:Arial;}\r\n-->\r\n</style>\r\n'
+                '\t<!-- This is a HTML comment.\r\nThere is a horizontal tab (%x09) character '
+                'before the comment, \r\nand some new lines inside the comment. -->\r\n'
+                '</head>\r\n<body>\r\n<p\r\nclass="MsoNormal">Note the line break inside a P '
+                'tag. <b>This is a bold text</b> </p>\r\n<p class="MsoNormal">\r\nThis is a '
+                'normal text with a character references:&nbsp;&lt;&uml;<br>\r\ncharacters '
+                'which have special meaning in RTF: {}\\<br>\r\n</p>\r\n<ol>\r\n'
+                '<li class="MsoNormal">This is a list item\r\n</ol>\r\n</body>\r\n</HTML>\r\n')
+        self.assertEqual(html, want)
+
+    def test_recognition(self):
+        self.assertEqual(P.rtf_encapsulation(b"{\\rtf1\\ansi\\fromtext x}"), "text")
+        self.assertEqual(P.rtf_encapsulation(b"{\\rtf1\\ansi\\fromhtml1 x}"), "html")
+        self.assertIsNone(P.rtf_encapsulation(b"{\\rtf1\\ansi\\fromhtml x}"))   # must be \fromhtml1
+        self.assertIsNone(P.rtf_encapsulation(b"{\\rtf1 x\\fromtext}"))          # text comes first
+        self.assertIsNone(P.rtf_encapsulation(b"{\\rtf1" + b"\\a" * 9 + b"\\fromtext}"))  # 11th
+        self.assertIsNone(P.rtf_encapsulation(b"{\\rtf2\\fromtext}"))
+        self.assertEqual(P.deencapsulate_rtf(b"{\\rtf1\\ansi plain rtf}"), (None, None))
+
+    def text(self, body, head=b"\\ansi\\ansicpg1252"):
+        kind, text = P.deencapsulate_rtf(b"{\\rtf1" + head + b"\\fromtext" + body + b"}")
+        self.assertEqual(kind, "text")
+        return text
+
+    def test_text_rules(self):
+        self.assertEqual(self.text(b" a\\par b\\line c\\tab d"), "a\r\nb\r\nc\td")
+        self.assertEqual(self.text(b" caf\\'e9 \\{x\\} \\\\"), "café {x} \\")
+        # CR and LF are not text; the CR ends \fromtext, so the space after it is text
+        self.assertEqual(self.text(b"\r\n ab\r\ncd"), " abcd")
+        self.assertEqual(self.text(b"{\\colortbl\\red0;}x"), "x")         # a destination is skipped
+        self.assertEqual(self.text(b"{\\*\\unknownword hidden}x"), "x")   # so is any \* group
+        self.assertEqual(self.text(b" \\lquote q\\rquote  \\emdash"), "‘q’ —")
+
+    def test_unicode_and_fallback(self):
+        self.assertEqual(self.text(b" \\u8364?x"), "€x")              # \uc1 by default
+        self.assertEqual(self.text(b"\\uc2 \\u8364??x"), "€x")
+        self.assertEqual(self.text(b"\\uc0 \\u8364 x"), "€x")
+        self.assertEqual(self.text(b" \\u-4064?"), "\uf020")               # negative values
+        self.assertEqual(self.text(b" \\u8364\\'80x"), "€x")          # \'hh counts as one
+        self.assertEqual(self.text(b"{\\uc2 \\u8364??}\\u8364?x"), "€€x")  # scoped
+
+    def test_code_pages(self):
+        fonts = b"{\\fonttbl{\\f0\\fcharset0 A;}{\\f1\\fcharset204 B;}{\\f2\\fcharset0\\cpg1253 C;}}"
+        self.assertEqual(self.text(fonts + b"\\f1 \\'c0\\f0 \\'c0\\f2 \\'c1"), "АÀΑ")
+        self.assertEqual(self.text(b" \\'c0", head=b"\\ansi\\ansicpg1251"), "А")
+        # a double-byte code page: the two bytes of one character arrive as two \'hh
+        jp = b"{\\fonttbl{\\f0\\fcharset128 M;}}\\f0 \\'82\\'a0"
+        self.assertEqual(self.text(jp), "あ")
+
+    def test_fields_upr_and_binary(self):
+        field = b"{\\field{\\*\\fldinst HYPERLINK \"http://x\"}{\\fldrslt link}}"
+        self.assertEqual(self.text(b" see " + field), "see link")
+        self.assertEqual(self.text(b"{\\upr{\\b ansi}{\\*\\ud{\\b uni\\u8364?}}}"), "uni€")
+        self.assertEqual(self.text(b"{\\pict\\bin3 }}}x}y"), "y")
+
+    def test_htmlrtf_scoping(self):
+        rtf = (b"{\\rtf1\\ansi\\fromhtml1 {\\*\\htmltag <p>}\\htmlrtf {a\\htmlrtf0 b} c\\htmlrtf0 d"
+               b"{\\*\\htmltag </p>}}")
+        self.assertEqual(P.deencapsulate_rtf(rtf), ("html", "<p>bd</p>"))
+
+
 class ExportTests(unittest.TestCase):
     def test_export_folder_writes_items_and_attachments(self):
         import json

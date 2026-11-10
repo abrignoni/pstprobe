@@ -63,13 +63,15 @@ python3 pstprobe.py items    mailbox.pst      # one JSON line per item
 python3 pstprobe.py items    --subjects mailbox.pst
 python3 pstprobe.py props    mailbox.pst 0x200044   # every property of one node
 python3 pstprobe.py body     mailbox.pst 0x200044 --format rtf -o body.rtf
+python3 pstprobe.py body     mailbox.pst 0x200044 --format from-rtf -o body.txt
 python3 pstprobe.py extract  mailbox.pst -o attachments/
 python3 pstprobe.py export   mailbox.pst --folder 0x8082 -o out/      # one folder
 python3 pstprobe.py export   mailbox.pst --recursive -o out/          # every folder
 ```
 
 `body` writes one item's body: `text` (PidTagBody, as UTF-8), `html` (PidTagBodyHtml as
-stored) or `rtf` (PidTagRtfCompressed, decompressed). It writes to standard output, or with
+stored), `rtf` (PidTagRtfCompressed, decompressed) or `from-rtf` (the plain text or HTML that
+the RTF encapsulates, below). It writes to standard output, or with
 `-o` to a file that must not exist yet.
 
 `items` gives each item's folder, NID, message class, recipient count and its
@@ -81,7 +83,9 @@ folder of its own named from its display name and NID): `folder.json` with the f
 properties, `items.jsonl` with one line per item (every property with its
 [MS-OXPROPS] name, type and value, the recipients, and the attachments, attached items
 included), each compressed RTF body decompressed under `bodies/` as `<item NID>.rtf` (named
-in the item's line as `rtf_file`), and the file attachments under `attachments/`, named
+in the item's line as `rtf_file`) and, when it encapsulates plain text or HTML, that text as
+`<item NID>.from-rtf.txt` or `.from-rtf.html` (`rtf_original_file`), and the file
+attachments under `attachments/`, named
 `<item NID>_<attachment NID>_<stored name>`. An attachment of an attached item adds the
 attached item's attachment NID to the chain (`<item NID>_<NID>_<NID>_<stored name>`),
 because attachment NIDs are local to the item that holds them. A file that already exists
@@ -104,8 +108,8 @@ python3 pstprobe_gui.py [mailbox.pst]
 each folder's item count. On the right are the selected folder's items, 500 to a page,
 with their delivery and modification times (UTC) first. Below them, tabs show the
 selected item's properties with their names, its recipients, its attachments and its
-body: the plain text, the HTML source or the RTF source (decompressed), whichever the item
-stores, shown as text and never rendered (HTML decoded by the item's PidTagInternetCodepage
+body: the plain text, the HTML source, the RTF source (decompressed) or the text or HTML the
+RTF encapsulates, whichever the item has, shown as text and never rendered (HTML decoded by the item's PidTagInternetCodepage
 when Python knows it, else as UTF-8, else as cp1252). NUL characters are left out of the shown text
 (Tk drops them); Save Body writes the stored bytes. It saves a body, one attachment, all
 of an item's attachments, or exports a
@@ -142,9 +146,10 @@ testing. The binaries bundle Python 3.13 with Tk 8.6.
 
 ## What it does not do yet
 
-- RTF bodies are decompressed, not converted. An RTF body that wraps plain text or HTML
-  (`\fromtext`, `\fromhtml1`, [MS-OXRTFEX]) is returned as RTF; the wrapped text is not
-  extracted from it.
+- An RTF body that encapsulates nothing (a document written as RTF) is returned as RTF; it
+  is not converted to text.
+- De-encapsulation does not place attachments at their `\objattph` positions ([MS-OXRTFEX]
+  2.2.3.4); attachments are listed on their own.
 - No recovery. Items that are no longer linked from a folder, and data in free space,
   are not looked for. `info` counts every node in the node B-tree by type, so a
   difference from the items the folders list is visible. In the Outlook PST above, a
@@ -221,6 +226,24 @@ none. The tests include
 the specification's two worked examples. (Its second example prints the result as
 `{\ref1 ...`; the compressed bytes can only give `{\rtf1 ...`, and the CRC matches.)
 
+An RTF body that encapsulates plain text (`\fromtext`) or HTML (`\fromhtml1`) is
+de-encapsulated by `deencapsulate_rtf`, following [MS-OXRTFEX] 2.2.3 over the RTF syntax of
+the RTF 1.9.1 specification: recognition in the first 10 tokens, HTMLTAG content, HTMLRTF
+suppression scoped by group, destinations skipped (the list is the 294 control words the
+RTF specification's index types as destinations), and text decoded by the current font's
+code page. What it was checked against:
+
+- Plain text, against a second record: in the Enron set, all 62 RTF bodies that encapsulate
+  plain text de-encapsulate to exactly the item's own PidTagBody (CRLF compared as LF, and
+  trailing line breaks, spaces and NULs set aside).
+- HTML, against the specification only: its worked example (3.1) comes out as the example's
+  RTF says. No HTML-encapsulating body read so far has a stored PidTagBodyHtml to compare
+  with (16 in the Enron set, 1 in the public test files), so on real data this path is
+  checked for shape, not content.
+- In the public test files, the 488 plain-text-encapsulating bodies are all one short
+  template that holds no text after its header and font table, and de-encapsulate to empty
+  text.
+
 `tools/gui_exercise.py` drives the window itself, with Tk's event loop running: it opens
 each file, expands every folder, shows every page, checks the tabs of a sample of items
 against the reader, switches bodies, sorts, copies, saves and exports (comparing the
@@ -228,7 +251,7 @@ files with `export_folder`), refuses a second save to the same name, cancels a t
 refuses a second export into the same folder (leaving the first byte for byte as it was),
 and opens a damaged copy and a file that is not a PST. Cancel is tried while the export is
 held at its first read, so it is reached on every file that has items. On 24 files (23
-distinct: the Outlook PSTs, the CFReDS OST and the public test files) it ran 4,809 checks
+distinct: the Outlook PSTs, the CFReDS OST and the public test files) it ran 5,241 checks
 with no failure on each of macOS 27 (Python 3.12, Tk 8.6), Windows 11 on ARM (Python 3.11,
 Tk 8.6) and Ubuntu 26.04 (Python 3.14, Tk 8.6).
 
@@ -250,6 +273,9 @@ The tests (`python3 -m unittest discover -s tests`) need no data and no packages
   for property IDs.
 - Microsoft, [MS-OXRTFCP] v20250520, for compressed RTF: the header, the 207-byte
   dictionary, runs and references, and the CRC.
+- Microsoft, [MS-OXRTFEX] v20250520, 2.1.3.1 and 2.2.3, for de-encapsulation, and Microsoft,
+  "Rich Text Format (RTF) Specification", version 1.9.1 (2008), for RTF syntax, `\uN` and
+  `\ucN`, `\binN`, the `\fcharsetN` code page table and the index of destinations.
 
 ## License
 

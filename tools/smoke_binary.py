@@ -3,7 +3,7 @@
     python tools/smoke_binary.py --cli dist/pstprobe [--gui PATH] [--version 0.2.0] [FILE ...]
 
 The CLI binary must print the expected version and give the same output as `python pstprobe.py`
-for info, folders, items, props, body (text, html and rtf, for up to 25 items) and export, on a
+for info, folders, items, props, body (text, html, rtf and from-rtf, for up to 25 items) and export, on a
 PST built by tests/pstbuilder.py (with a compressed RTF body) and on any FILE given. The window binary must pass --selfcheck on the built PST. A windowed Windows build
 has no stdout, so only its exit code is checked there. Run it from the repository root; on
 Linux, run it under a virtual display.
@@ -65,7 +65,7 @@ def compare(source, binary, path, label, work):
             if line.startswith("{")][:25]
     same, tried = 0, 0
     for nid in nids:
-        for fmt in ("text", "html", "rtf"):
+        for fmt in ("text", "html", "rtf", "from-rtf"):
             sub = ["body", path, str(nid), "--format", fmt]
             tried += 1
             same += run_raw(source + sub) == run_raw(binary + sub)

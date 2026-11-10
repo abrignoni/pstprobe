@@ -39,6 +39,8 @@ def check_message(m, r, depth):
         header = pstprobe.rtf_header(rtf_value)
         if header["comptype"] == "LZFu" and header["rawsize"] != len(rtf):
             r["failures"]["RTF length differs from RAWSIZE"] += 1
+        kind, _text = pstprobe.deencapsulate_rtf(rtf)
+        r["rtf_encapsulates"][kind or "nothing"] += 1
     recips = m.recipients()
     r["recipients"] += len(recips)
     if depth == 0:
@@ -78,7 +80,7 @@ def check_file(path, name=None):
     """path may be a binary file object, with name for the report."""
     r = {"file": name or os.path.basename(path), "folders": 0, "items": 0, "recipients": 0,
          "attachments": 0, "attached_items": 0, "rtf_bodies": 0, "attachments_without_data": 0,
-         "attachment_bytes": 0, "display_list": Counter(), "failures": Counter(),
+         "attachment_bytes": 0, "display_list": Counter(), "rtf_encapsulates": Counter(), "failures": Counter(),
          "failure_examples": []}
     start = time.monotonic()
     try:

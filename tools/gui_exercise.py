@@ -295,6 +295,14 @@ class Exercise:
         want = "\t".join(str(v) for v in view.item(first, "values"))
         self.check(self.root.clipboard_get() == want, "copied row")
         r["sorted_columns"] = len(view["columns"])
+        # the body bar's buttons and Save Body all fit
+        self.w.tabs.select(3)
+        self.root.update()
+        bar = self.w.save_body_button.master
+        right = max(b.winfo_x() + b.winfo_width() for b in self.w.body_buttons.values())
+        self.check(right <= self.w.save_body_button.winfo_x() <= bar.winfo_width() - 1,
+                   "body buttons overlap Save Body or it is cut off (%d, %d, %d)"
+                   % (right, self.w.save_body_button.winfo_x(), bar.winfo_width()))
 
     def save_checks(self, r, folder):
         """Save one attachment, all of an item's attachments, a body, and refuse a second save."""
@@ -330,7 +338,7 @@ class Exercise:
         # a body: the first item of the folder that has one
         for nid in folder.message_nids()[:200]:
             bodies = gui.item_bodies(self.w.pst.message(nid))
-            if any(raw is not None for _t, raw in bodies.values()):
+            if any(entry[1] is not None for entry in bodies.values()):
                 break
         else:
             return
