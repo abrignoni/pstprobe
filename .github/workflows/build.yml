@@ -73,7 +73,10 @@ jobs:
           import hashlib, os
           checked = 0
           for line in open('_sums/SHA256SUMS.txt'):
-              digest, name = line.split()
+              if not line.strip():
+                  continue
+              digest, name = line.split(None, 1)
+              name = name.strip().lstrip('*')   # sha256sum marks binary mode with *
               if not os.path.isfile(name):
                   # a binary or other release file that is not in the tag
                   print(name, 'not in the tag, not checked here')

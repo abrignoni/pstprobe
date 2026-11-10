@@ -113,8 +113,9 @@ is never replaced: the write stops with an error, and an export into a folder th
 holds an export (its `items.jsonl`) is refused before anything is written. A stored name
 is cut to 180 bytes (UTF-8), keeping a short extension. A damaged item gets a line with
 its `error` and the export goes on; a damaged folder is counted under `errors` and named
-in `folder_errors`; a folder that a hierarchy table lists a second time is exported once
-and counted in `folders_repeated`. `extract` writes every file attachment of the whole
+on standard error; a folder that a hierarchy table lists a second time is exported once,
+and the command says how many there were. (`export_folder` returns the same as
+`folder_errors` and `folders_repeated`.) `extract` writes every file attachment of the whole
 file, those of attached items included, with the same names; it goes past a damaged item
 (naming it on standard error) and exits 1 if there was one. Output on standard output and
 standard error is UTF-8.
@@ -165,7 +166,8 @@ testing. The binaries bundle Python 3.13 with Tk 8.6.
   otherwise. A file written on a system with another code page therefore shows wrong
   characters in those names until the right one is given. The window always uses 1252
   there. A PtypString8 PidTagBody is decoded with PidTagInternetCodepage, the body's code
-  page (2.747), when the item has one. Only Western (1252) ANSI files have been read.
+  page (2.747), when the item has one and the body decodes in it; otherwise as the item's
+  other 8-bit strings. Bytes a code page does not define become U+FFFD. Only Western (1252) ANSI files have been read.
 - `Message.subject` drops the two-character prefix marker (SOH and a length) that a
   stored subject can start with. `get(0x0037)` returns the subject as stored.
 - Named properties (IDs from 0x8000) are resolved through the store's name-to-ID map:

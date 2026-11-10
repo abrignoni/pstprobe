@@ -18,8 +18,9 @@ jobs:
         os: [ubuntu-latest]
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
         include:
+          # 3.13: python.org's 3.14 for macOS ships Tk 9, which aborts the window test there
           - os: macos-latest
-            python: "3.14"
+            python: "3.13"
           - os: windows-latest
             python: "3.14"
     steps:

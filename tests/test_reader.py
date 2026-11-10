@@ -249,6 +249,21 @@ class HardeningTests(unittest.TestCase):
         ascii_ = b.pc([(0x3001, P.PT_STRING8, b"kd"), (0x3FFD, P.PT_INT32, pstbuilder.i32(20127))])
         self.assertEqual(P.PropertyContext(self.FakeNode([ascii_])).codepage, "ascii")
 
+    def test_8bit_body_falls_back_when_it_is_not_in_the_internet_code_page(self):
+        b = pstbuilder.Builder("ansi")
+        text = "\u53d7\u4fe1"
+        stored = text.encode("cp932")
+        for inet, want in ((65001, text), (20127, text), (932, text)):
+            with self.subTest(inet=inet):
+                pc = b.pc([(P.PID_TAG_BODY, P.PT_STRING8, stored),
+                           (0x3FFD, P.PT_INT32, pstbuilder.i32(932)),
+                           (0x3FDE, P.PT_INT32, pstbuilder.i32(inet))])
+                self.assertEqual(P.Message(None, self.FakeNode([pc])).body(), want)
+        # a body that decodes in the Internet code page is read in it
+        pc = b.pc([(P.PID_TAG_BODY, P.PT_STRING8, "\u0418".encode("cp1251")),
+                   (0x3FDE, P.PT_INT32, pstbuilder.i32(1251))])
+        self.assertEqual(P.Message(None, self.FakeNode([pc])).body(), "\u0418")
+
     def test_codepage_option(self):
         raw, _ = pstbuilder.build_sample("ansi")
         with P.open_pst(io.BytesIO(raw), codepage=1251) as pst:

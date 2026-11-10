@@ -1144,7 +1144,10 @@ def decode_value(ptype, data, codepage="cp1252"):
 def _decode8(data, codepage):
     try:
         return bytes(data).decode(codepage)
-    except (LookupError, UnicodeDecodeError):
+    except UnicodeDecodeError:
+        # bytes the code page does not define become U+FFFD; the rest keep that code page
+        return bytes(data).decode(codepage, "replace")
+    except LookupError:
         return bytes(data).decode("cp1252", "replace")
 
 
@@ -1909,7 +1912,11 @@ class Message:
             cp = self.pc.get(PID_TAG_INTERNET_CODEPAGE)
             codec = codepage_codec(cp) if isinstance(cp, int) and cp > 0 else None
             if codec:
-                return decode_value(PT_STRING8, self.pc.raw(PID_TAG_BODY), codec)
+                data = bytes(self.pc.raw(PID_TAG_BODY) or b"").split(b"\x00", 1)[0]
+                try:
+                    return data.decode(codec)
+                except UnicodeDecodeError:
+                    pass    # not in that code page: decode as the item's other 8-bit strings
         return self.pc.get(PID_TAG_BODY)
 
     def html_body(self):
@@ -2543,6 +2550,11 @@ def _cmd_export(pst, args):
     counts = export_folder(pst, folder, args.output, recursive=args.recursive)
     print("%(folders)d folders, %(items)d items, %(attachments)d attachment files, %(errors)d errors" % counts
           + " written to %s" % args.output)
+    if counts["folders_repeated"]:
+        print("%d folders listed again by a hierarchy table were exported once"
+              % counts["folders_repeated"])
+    for line in counts.get("folder_errors", []):
+        print("pstprobe: folder %s" % line, file=sys.stderr)
 
 
 def _cmd_verify(pst, args):
