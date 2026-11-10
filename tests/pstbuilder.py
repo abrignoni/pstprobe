@@ -173,7 +173,13 @@ class Builder:
                     data = P.crypt_cyclic(data, bid)
             inflated = len(data)
             if bid in self.inflate:
-                data = zlib.compress(data)
+                # a reader tells a compressed block by its size differing from the inflated
+                # size, so keep the compressed form only when it is smaller. zlib builds differ
+                # (Python 3.14 on Windows ships zlib-ng), and a block that compresses to its own
+                # length would read as uncompressed.
+                packed = zlib.compress(data)
+                if len(packed) < len(data):
+                    data = packed
             cb = len(data)
             alloc = L.block_alloc(cb)
             ib = len(out)
