@@ -100,10 +100,18 @@ jobs:
           # redirected output would otherwise be cp1252
           COMMON=(--noconfirm --clean --hidden-import pstprobe_names --python-option "X utf8")
           python -m PyInstaller "${COMMON[@]}" --onefile --console --name pstprobe pstprobe.py
+          # the window carries its logo and icons; the program icon is per system
+          case "$RUNNER_OS" in
+            Windows) ICON=assets/pstprobe.ico ;;
+            macOS) ICON=assets/pstprobe.icns ;;
+            *) ICON=NONE ;;
+          esac
+          # (a tag from before the window had a logo has no assets folder)
+          if [ -d assets ]; then WINDOW=(--add-data "assets:assets" --icon "$ICON"); else WINDOW=(); fi
           if [ "$RUNNER_OS" = "macOS" ]; then
-            python -m PyInstaller "${COMMON[@]}" --windowed --onedir --name pstprobe-window pstprobe_gui.py
+            python -m PyInstaller "${COMMON[@]}" "${WINDOW[@]}" --windowed --onedir --name pstprobe-window pstprobe_gui.py
           else
-            python -m PyInstaller "${COMMON[@]}" --windowed --onefile --name pstprobe-window pstprobe_gui.py
+            python -m PyInstaller "${COMMON[@]}" "${WINDOW[@]}" --windowed --onefile --name pstprobe-window pstprobe_gui.py
           fi
           ls -la dist
       - name: Check the binaries against the source

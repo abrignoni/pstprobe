@@ -783,7 +783,8 @@ class WindowTest(unittest.TestCase):
                 self.skipTest("no display")
             self.fail("window self-check failed (%d): %s" % (done.returncode, done.stderr[-500:]))
         self.assertEqual(json.loads(done.stdout), {
-            "window": "built", "menus": 4 + (sys.platform == "darwin"), "folders_shown": 2,
+            "window": "built", "menus": 4 + (sys.platform == "darwin"), "logo": True, "icon": True,
+            "folders_shown": 2,
             "items_shown": 1, "properties_shown": 4, "recipients_shown": 2, "attachments_shown": 1,
             # the sample's RTF is a document, not encapsulated: the window shows its text
             # ("hello world") first, with the one attachment marked at the end

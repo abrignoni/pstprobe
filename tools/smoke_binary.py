@@ -110,6 +110,9 @@ def main():
                       and report.get("bodies_shown") == ["from-rtf", "rtf"]
                       and report.get("body_bytes_saved") == 11,
                       "window loaded the file: %s" % report)
+                if "logo" in report:   # a window from before the logo does not report one
+                    check(report["logo"] is True and report.get("icon") is True,
+                          "window has its logo and icon: %s" % report)
             else:
                 print("note  the window printed nothing (a windowed Windows build has no stdout)")
             for path in args.files:
