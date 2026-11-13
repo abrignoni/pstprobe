@@ -133,7 +133,8 @@ python3 pstprobe_gui.py [mailbox.pst]
 `pstprobe_gui.py` is an optional tkinter window, standard library only, that needs
 `pstprobe.py` and `pstprobe_theme.py` beside it (its logo is read from `assets/` and left out
 when that folder is missing). A switch in its header, or View > Dark Mode, picks the light or
-dark look; until one is chosen it follows the system. On the left is the folder tree with
+dark look; until one is chosen it follows the system's setting where it can read it
+(macOS, Windows, and GNOME's setting on Linux), otherwise light. On the left is the folder tree with
 each folder's item count. On the right are the selected folder's items, 500 to a page,
 with their delivery and modification times (UTC) first. Below them, tabs show the
 selected item's properties with their names, its recipients, its attachments and its
