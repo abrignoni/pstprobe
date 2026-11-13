@@ -38,7 +38,7 @@ import uuid
 import zlib
 from collections import OrderedDict
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "open_pst", "PSTFile", "Folder", "Message", "Attachment", "Node",
